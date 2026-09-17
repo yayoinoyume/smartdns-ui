@@ -20,6 +20,7 @@ pub mod data_server;
 pub mod data_stats;
 pub mod data_upstream_server;
 pub mod db;
+pub mod hostname;
 pub mod http_api_msg;
 pub mod http_error;
 pub mod http_jwt;
