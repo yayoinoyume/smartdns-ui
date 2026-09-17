@@ -28,7 +28,8 @@ jobs:
       - name: 系统依赖
         run: |
           sudo apt-get update
-          sudo apt-get install -y libgtest-dev clang libclang-dev
+          # libssl-dev / pkg-config 是构建 C 测试库 libsmartdns-test.a 需要的
+          sudo apt-get install -y libgtest-dev libssl-dev pkg-config clang libclang-dev
 
       - name: 缓存 bindgen-cli
         id: bindgen
@@ -87,9 +88,14 @@ jobs:
         run: |
           sudo mkdir -p /opt/tc
           sudo tar --zstd -x -C /opt/tc -f ~/openwrt-toolchain.tar.zst
-          CC=$(find /opt/tc -type f -name 'x86_64-openwrt-linux-musl-gcc' | head -1)
-          [ -n "$CC" ] || { echo "::error::工具链里找不到 x86_64-openwrt-linux-musl-gcc"; exit 1; }
-          echo "用这个编译器: $CC"
+          # 注意：不能加 -type f —— 那个编译器是个符号链接，-type f 会找不到它。
+          CC=$(find /opt/tc -name 'x86_64-openwrt-linux-musl-gcc' -print -quit)
+          if [ -z "$CC" ] || [ ! -x "$CC" ]; then
+            echo "::error::工具链里找不到可执行的 x86_64-openwrt-linux-musl-gcc"
+            ls -la /opt/tc
+            exit 1
+          fi
+          echo "用这个编译器: $CC ($($CC --version | head -1))"
           echo "CC=$CC" >> "$GITHUB_ENV"
 
       - name: 缓存 cargo
