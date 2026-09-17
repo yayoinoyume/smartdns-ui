@@ -1,0 +1,200 @@
+name: Build smartdns_ui.so
+
+# 上游更新会由 sync-upstream.yml 合进 feat/client-hostname；
+# 只要插件目录 / C 头文件 / CI 配置有变化，这里就会自动编译、验证、发版。
+
+on:
+  push:
+    branches: [feat/client-hostname]
+    paths:
+      - 'plugin/smartdns-ui/**'
+      - 'src/include/**'
+      - 'ci/**'
+      - '.github/workflows/build-ui.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  # ---------------------------------------------------------------- 闸①
+  unit-tests:
+    name: 单元测试（原生 x86_64）
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: 系统依赖
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libgtest-dev clang libclang-dev
+
+      - name: 缓存 bindgen-cli
+        id: bindgen
+        uses: actions/cache@v4
+        with:
+          path: ~/.cargo/bin/bindgen
+          key: bindgen-cli-${{ runner.os }}-0.69.5
+
+      - name: 安装 bindgen-cli
+        if: steps.bindgen.outputs.cache-hit != 'true'
+        run: cargo install --force --locked bindgen-cli
+
+      - name: 跑插件单测（含 hostname.rs 的单测与 REST API 测试）
+        run: EXTRA_CFLAGS=-fPIC make -C plugin/smartdns-ui test -j$(nproc)
+
+  # ---------------------------------------------------------------- 闸②③
+  build:
+    name: 交叉编译 + 产物检查
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: 系统依赖
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang libclang-dev binutils file zstd curl
+
+      - name: 缓存 bindgen-cli
+        id: bindgen
+        uses: actions/cache@v4
+        with:
+          path: ~/.cargo/bin/bindgen
+          key: bindgen-cli-${{ runner.os }}-0.69.5
+
+      - name: 安装 bindgen-cli
+        if: steps.bindgen.outputs.cache-hit != 'true'
+        run: cargo install --force --locked bindgen-cli
+
+      # 与本地已验证的 Docker 环境用同一份官方工具链，保证行为一致
+      - name: 缓存 OpenWrt 工具链
+        id: tc
+        uses: actions/cache@v4
+        with:
+          path: ~/openwrt-toolchain.tar.zst
+          key: openwrt-toolchain-25.12.5-x86-64_gcc-14.3.0_musl
+
+      - name: 下载 OpenWrt 工具链
+        if: steps.tc.outputs.cache-hit != 'true'
+        run: |
+          curl -fsSL --retry 5 --retry-all-errors --retry-delay 3 \
+            -o ~/openwrt-toolchain.tar.zst \
+            https://downloads.openwrt.org/releases/25.12.5/targets/x86/64/openwrt-toolchain-25.12.5-x86-64_gcc-14.3.0_musl.Linux-x86_64.tar.zst
+
+      - name: 解压工具链
+        run: |
+          sudo mkdir -p /opt/tc
+          sudo tar --zstd -x -C /opt/tc -f ~/openwrt-toolchain.tar.zst
+          CC=$(find /opt/tc -type f -name 'x86_64-openwrt-linux-musl-gcc' | head -1)
+          [ -n "$CC" ] || { echo "::error::工具链里找不到 x86_64-openwrt-linux-musl-gcc"; exit 1; }
+          echo "用这个编译器: $CC"
+          echo "CC=$CC" >> "$GITHUB_ENV"
+
+      - name: 缓存 cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            plugin/smartdns-ui/target
+          key: cargo-musl-${{ runner.os }}-${{ hashFiles('plugin/smartdns-ui/Cargo.lock') }}
+          restore-keys: cargo-musl-${{ runner.os }}-
+
+      - name: 编译插件
+        run: make -C plugin/smartdns-ui OPTIMIZE_SIZE=1
+
+      - name: 产物检查 + 符号兼容性
+        run: sh ci/check-artifact.sh plugin/smartdns-ui/target/smartdns_ui.so ci/router-symbols.txt
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: smartdns_ui.so
+          path: plugin/smartdns-ui/target/smartdns_ui.so
+          if-no-files-found: error
+
+  # ---------------------------------------------------------------- 闸④
+  smoke:
+    name: 容器冒烟（上游主程序 + 本插件）
+    needs: build
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: smartdns_ui.so
+          path: smoke
+
+      - name: 取上游同版本主程序
+        run: |
+          # 不把某一台设备的二进制提交进仓库（那样换设备就废了）。
+          # 上游每个 release 都同时发多个架构的包，这里取 x86_64 的 ipk，
+          # 解出里面的主程序来配我们的插件 —— 主程序与插件同源，结论对任何设备都成立。
+          url=$(curl -fsSL 'https://api.github.com/repos/PikuZheng/smartdns/releases?per_page=30' \
+            | jq -r '.[] | select(.tag_name | test("_with_ui$")) | .assets[].browser_download_url' \
+            | grep -E 'x86_64\.ipk$' | head -1)
+          [ -n "$url" ] || { echo "::error::上游 release 里找不到 x86_64 ipk"; exit 1; }
+          echo "主程序来源: $url"
+          curl -fsSL --retry 5 --retry-all-errors --retry-delay 3 -o pkg.ipk "$url"
+          mkdir -p pkg && tar -xzf pkg.ipk -C pkg && tar -xzf pkg/data.tar.gz -C pkg
+          cp pkg/usr/sbin/smartdns smoke/main.smartdns
+          cp ci/smoke/run.sh smoke/run.sh
+          file smoke/main.smartdns
+
+      - name: 跑冒烟
+        run: |
+          docker run --rm -v "$PWD/smoke":/w alpine:3.22 sh -c \
+            "apk add --no-cache bind-tools libgcc iproute2 sqlite zlib >/dev/null 2>&1; sh /w/run.sh"
+
+  # ---------------------------------------------------------------- 发版
+  release:
+    name: 发版
+    needs: [unit-tests, build, smoke]
+    if: github.ref == 'refs/heads/feat/client-hostname'
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: smartdns_ui.so
+          path: dist
+
+      - name: 生成版本号与校验和
+        id: ver
+        run: |
+          base=$(git describe --tags --abbrev=0 --match '*_with_ui' --exclude '*canary*' 2>/dev/null || echo "hn")
+          tag="${base}+hn.$(date -u +%Y%m%d).$(git rev-parse --short HEAD)"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "版本号: $tag"
+          cd dist
+          sha256sum smartdns_ui.so | tee sha256.txt
+
+      - name: 发布 Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release create '${{ steps.ver.outputs.tag }}' \
+            dist/smartdns_ui.so dist/sha256.txt \
+            --title '${{ steps.ver.outputs.tag }}' \
+            --notes 'smartdns-ui 插件（客户端主机名显示）。基于上游 ${{ steps.ver.outputs.tag }} 之前最近的 upstream tag 构建。
+
+          - 提交: ${{ github.sha }}
+          - 构建: GitHub Actions run ${{ github.run_number }}
+          - 验证: 单元测试 + 产物检查 + 符号兼容性 + 容器冒烟，全部通过才发版
+
+          部署到路由器请用本机 deploy.sh，不要手工 scp。'
+          echo "已发布 ${{ steps.ver.outputs.tag }}"
+
+      - name: 只保留最近 10 个 release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        continue-on-error: true
+        run: |
+          gh release list --limit 200 --json tagName --jq '.[].tagName' \
+            | tail -n +11 \
+            | xargs -r -I{} gh release delete {} --yes --cleanup-tag
