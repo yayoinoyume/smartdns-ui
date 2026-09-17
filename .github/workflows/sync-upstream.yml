@@ -1,0 +1,61 @@
+name: Sync upstream (PikuZheng)
+
+# 把上游 PikuZheng/smartdns 的新提交合进我们的两个分支。
+# 用 merge 而不是强推 —— 因为 master 上放着我们自己的 workflow 文件，
+# 强推会把它抹掉（上游自带的 fetch upstream.yml 就是强推，所以那个要禁用）。
+#
+# 冲突时直接失败退出，让 GitHub 发邮件通知人去处理，不做任何猜测性操作。
+# 处理期间路由器上跑的还是旧版本，线上不受影响。
+
+on:
+  schedule:
+    - cron: '0 19 * * *'   # UTC 19:00 = 北京时间次日 03:00
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  sync:
+    name: 同步上游并推进特性分支
+    runs-on: ubuntu-latest
+    steps:
+      # 用 PAT 而不是 GITHUB_TOKEN：GITHUB_TOKEN 的推送不会触发下游 workflow，
+      # 那样合完了也不会自动编译。
+      - uses: actions/checkout@v4
+        with:
+          ref: master
+          fetch-depth: 0
+          token: ${{ secrets.SYNC_TOKEN }}
+
+      - name: git 身份
+        run: |
+          git config user.name  'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+
+      - name: 合并上游到 master
+        run: |
+          git remote add upstream https://github.com/PikuZheng/smartdns.git
+          git fetch upstream master
+          if git merge --no-edit upstream/master; then
+            echo "master 合并干净"
+          else
+            git merge --abort
+            echo "::error::上游合并到 master 有冲突，需要人工处理（本地 fetch 后手工 merge）。"
+            exit 1
+          fi
+          git push origin master
+
+      - name: 把 master 合进 feat/client-hostname
+        run: |
+          git fetch origin feat/client-hostname
+          git checkout feat/client-hostname
+          if git merge --no-edit origin/master; then
+            echo "特性分支合并干净"
+          else
+            git merge --abort
+            echo "::error::master 合并到 feat/client-hostname 有冲突，需要人工处理。"
+            echo "::error::提示：冲突很可能在 plugin/smartdns-ui/src/ 下，也就是我们改动的那 6 个文件。"
+            exit 1
+          fi
+          git push origin feat/client-hostname
