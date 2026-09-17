@@ -61,6 +61,14 @@ fn parse_lease_line(line: &str) -> Option<(String, String, String)> {
         return None;
     }
 
+    // A real address always contains '.' (IPv4) or ':' (IPv6). This rejects
+    // garbage lines that happen to have 4+ fields: field count alone is not
+    // enough, e.g. the comment "not a lease line" would otherwise be parsed
+    // as ip="lease", hostname="line" and pollute the whole map.
+    if !ip.contains('.') && !ip.contains(':') {
+        return None;
+    }
+
     Some((mac.to_string(), ip.to_string(), hostname.to_string()))
 }
 
@@ -395,11 +403,14 @@ mod tests {
         assert_eq!(parse_lease_line("1789665359 e0:70:ea:98:8a:53"), None);
         assert_eq!(parse_lease_line("1789665359 e0:70:ea:98:8a:53 192.168.2.1"), None);
 
-        // placeholder hostname
+        // 占位主机名
         assert_eq!(
             parse_lease_line("1789665359 aa:bb:cc:dd:ee:ff 10.0.0.3 * 01:aabbccddee"),
             None
         );
+
+        // too many words to be "short", but the ip field is not an address
+        assert_eq!(parse_lease_line("not a lease line"), None);
 
         // empty / blank lines
         assert_eq!(parse_lease_line(""), None);
