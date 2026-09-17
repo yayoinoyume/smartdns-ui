@@ -30,9 +30,17 @@ jobs:
           fetch-depth: 0
           token: ${{ secrets.SYNC_TOKEN }}
 
-      # 先验权限再干活。否则会在 git push 那里报一个含糊的 exit 128，
+      # 先验写权限再干活。否则会在 git push 那里报一个含糊的 exit 128，
       # 而真实原因（令牌没有写权限 / 密钥名写错 / 令牌过期）要翻半天日志。
-      - name: 预检 SYNC_TOKEN
+      #
+      # 重要：不要用 `gh api repos/... --jq .permissions.push` 做这个检查。
+      # 那个字段反映的是「当前账号在该仓库的角色」，不是「这个令牌被授予的权限」
+      # —— 仓库所有者永远是 push=true，所以那样检查永远通过，等于没检查。
+      # （实测踩过：首次触发时预检显示 success，紧接着推送就 403。）
+      #
+      # 正确做法：做一次 dry-run push。它会真的连上去完成认证与权限校验，
+      # 但不会真的改动任何 ref。
+      - name: 预检 SYNC_TOKEN 写权限
         env:
           GH_TOKEN: ${{ secrets.SYNC_TOKEN }}
         run: |
@@ -41,20 +49,20 @@ jobs:
             echo "::error::检查 Settings → Secrets and variables → Actions 里的名字是否正好是 SYNC_TOKEN。"
             exit 1
           fi
-          me=$(gh api user --jq .login 2>/dev/null || echo "?")
-          echo "SYNC_TOKEN 属于账号: $me"
-          push=$(gh api "repos/${{ github.repository }}" --jq '.permissions.push' 2>/dev/null || echo "unknown")
-          echo "对本仓库的 push 权限: $push"
-          case "$push" in
-            true) echo "权限正常" ;;
-            false)
-              echo "::error::SYNC_TOKEN 没有写权限（push=false）。"
-              echo "::error::去 GitHub → Settings → Developer settings → Fine-grained tokens → 编辑该令牌 →"
-              echo "::error::Repository permissions 里把 Contents 改成 Read and write，保存后重跑。"
-              exit 1 ;;
-            *)
-              echo "::warning::读不到 push 权限（可能令牌类型是 classic，或者是权限范围不含本仓库），继续尝试。" ;;
-          esac
+          echo "SYNC_TOKEN 属于账号: $(gh api user --jq .login 2>/dev/null || echo '(读不到)')"
+
+          if git push --dry-run origin HEAD:refs/heads/master > /tmp/dryrun.log 2>&1; then
+            echo "SYNC_TOKEN 写权限正常"
+          else
+            echo "::error::SYNC_TOKEN 没有写权限。git 的原话："
+            sed 's/^/::error::/' /tmp/dryrun.log
+            echo "::error::—— 修正办法 ——"
+            echo "::error::Settings → Developer settings → Personal access tokens → Fine-grained tokens"
+            echo "::error::→ 编辑该令牌 → Repository permissions → Contents 改成 Read and write → 保存"
+            echo "::error::注意：如果建令牌时选的是 'Public repositories (read-only)'，权限是锁死的、改不了，需重新建一个。"
+            echo "::error::改完直接重跑本 workflow 即可，不用动任何代码。"
+            exit 1
+          fi
 
       - name: git 身份
         run: |
