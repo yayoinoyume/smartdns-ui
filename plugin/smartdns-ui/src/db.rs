@@ -169,6 +169,10 @@ pub struct DomainListGetParam {
     pub domain_filter_mode: Option<String>,
     pub domain_type: Option<u32>,
     pub client: Option<String>,
+    /// Resolved client filter: every IP a hostname/localhost filter value
+    /// expands to, matched with `client IN (...)`. Takes precedence over
+    /// `client` when set.
+    pub client_ips: Option<Vec<String>>,
     pub domain_group: Option<String>,
     pub reply_code: Option<u16>,
     pub timestamp_before: Option<u64>,
@@ -189,6 +193,7 @@ impl DomainListGetParam {
             domain_filter_mode: None,
             domain_type: None,
             client: None,
+            client_ips: None,
             domain_group: None,
             reply_code: None,
             timestamp_before: None,
@@ -799,7 +804,16 @@ impl DB {
             order_timestamp_first = false;
         }
 
-        if let Some(v) = &param.client {
+        if let Some(ips) = &param.client_ips {
+            if !ips.is_empty() {
+                let placeholders = ips.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+                sql_where.push(format!("client IN ({})", placeholders));
+                for ip in ips {
+                    sql_param.push(ip.clone());
+                }
+                order_timestamp_first = false;
+            }
+        } else if let Some(v) = &param.client {
             sql_where.push("client = ?".to_string());
             sql_param.push(v.clone());
             order_timestamp_first = false;
@@ -1422,7 +1436,9 @@ impl DB {
         let mut stmt = tx.prepare("INSERT INTO client (id, client_ip, mac, hostname, last_query_timestamp) VALUES (
             (SELECT MAX(rowid) FROM client) + 1,
             ?1, ?2, ?3, ?4)
-            ON CONFLICT(client_ip, mac) DO UPDATE SET last_query_timestamp = excluded.last_query_timestamp;
+            ON CONFLICT(client_ip, mac) DO UPDATE SET
+                last_query_timestamp = excluded.last_query_timestamp,
+                hostname = CASE WHEN excluded.hostname = '' THEN hostname ELSE excluded.hostname END;
             ")?;
         for d in client_data {
             let ret = stmt.execute(rusqlite::params![
@@ -1552,6 +1568,76 @@ impl DB {
         };
 
         Ok((sql_where, sql_order, sql_param))
+    }
+
+    /// Fetch all persisted (client_ip, mac) pairs for the hostname cache warmup.
+    /// Only pairs with a real MAC are returned so runtime observations are usable.
+    pub fn get_client_ip_mac_pairs(&self) -> Result<Vec<(String, String)>, Box<dyn Error>> {
+        let conn = self.get_readonly_conn();
+        if conn.as_ref().is_none() {
+            return Err("db is not open".into());
+        }
+        let conn = conn.as_ref().unwrap();
+
+        let mut stmt = conn.prepare(
+            "SELECT client_ip, mac FROM client \
+             WHERE mac != '00:00:00:00:00:00' AND client_ip != ''",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?;
+
+        let mut pairs = Vec::new();
+        for row in rows {
+            pairs.push(row?);
+        }
+        Ok(pairs)
+    }
+
+    /// Rows of the client table whose hostname column is still empty, used by
+    /// the one-shot hostname backfill at startup.
+    pub fn get_client_rows_without_hostname(
+        &self,
+    ) -> Result<Vec<(u32, String, String)>, Box<dyn Error>> {
+        let conn = self.get_readonly_conn();
+        if conn.as_ref().is_none() {
+            return Err("db is not open".into());
+        }
+        let conn = conn.as_ref().unwrap();
+
+        let mut stmt = conn.prepare("SELECT id, client_ip, mac FROM client WHERE hostname = ''")?;
+        let rows = stmt.query_map([], |row| {
+            Ok((
+                row.get::<_, u32>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+            ))
+        })?;
+
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row?);
+        }
+        Ok(out)
+    }
+
+    /// Batch-update the hostname column in one transaction (startup backfill
+    /// only; regular per-query upserts never touch existing hostnames).
+    pub fn update_client_hostnames(&self, updates: &[(u32, String)]) -> Result<(), Box<dyn Error>> {
+        let mut conn = self.conn.lock().unwrap();
+        if conn.as_ref().is_none() {
+            return Err("db is not open".into());
+        }
+        let conn = conn.as_mut().unwrap();
+        let tx = conn.transaction()?;
+        {
+            let mut stmt = tx.prepare("UPDATE client SET hostname = ?2 WHERE id = ?1")?;
+            for (id, name) in updates {
+                stmt.execute(rusqlite::params![id, name])?;
+            }
+        }
+        tx.commit()?;
+        Ok(())
     }
 
     pub fn get_client_list(

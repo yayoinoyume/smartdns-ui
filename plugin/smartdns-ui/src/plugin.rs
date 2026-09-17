@@ -84,6 +84,18 @@ impl SmartdnsPlugin {
         opts.optopt("", "data-dir", "http data dir", "PATH");
         opts.optopt("", "token-expire", "http token expire time", "TIME");
         opts.optopt("", "https-port", "https server listen port", "PORT");
+        opts.optopt(
+            "",
+            "lease-file",
+            "dnsmasq lease file for client hostname display",
+            "PATH",
+        );
+        opts.optopt(
+            "",
+            "hostname-map",
+            "manual ip/mac to hostname map file for client hostname display",
+            "PATH",
+        );
         if args.len() <= 0 {
             return Ok(());
         }
@@ -144,6 +156,39 @@ impl SmartdnsPlugin {
                 return Err(Box::new(e));
             }
             http_conf.https_port = v.unwrap();
+        }
+
+        let mut lease_file = Plugin::dns_conf_plugin_config("smartdns-ui.lease-file");
+        if lease_file.is_none() {
+            lease_file = matches.opt_str("lease-file");
+        }
+        if let Some(lease_file) = lease_file {
+            let full_path = smartdns_conf_get_conf_fullpath(&lease_file);
+            crate::hostname::lease_cache().set_path(&full_path);
+            dns_log!(
+                LogLevel::INFO,
+                "client hostname display enabled with lease file: {}",
+                full_path
+            );
+        } else {
+            dns_log!(
+                LogLevel::INFO,
+                "smartdns-ui.lease-file not configured, client hostname display disabled."
+            );
+        }
+
+        let mut hostname_map = Plugin::dns_conf_plugin_config("smartdns-ui.hostname-map");
+        if hostname_map.is_none() {
+            hostname_map = matches.opt_str("hostname-map");
+        }
+        if let Some(hostname_map) = hostname_map {
+            let full_path = smartdns_conf_get_conf_fullpath(&hostname_map);
+            crate::hostname::lease_cache().set_manual_path(&full_path);
+            dns_log!(
+                LogLevel::INFO,
+                "client hostname manual map enabled: {}",
+                full_path
+            );
         }
 
         if let Some(data_dir) = matches.opt_str("data-dir") {

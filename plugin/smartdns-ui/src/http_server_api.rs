@@ -525,10 +525,13 @@ impl API {
         get_param.id = Some(id);
 
         let data_server = this.get_data_server();
-        let domain_list = data_server.get_domain_list(&get_param)?;
+        let mut domain_list = data_server.get_domain_list(&get_param)?;
         if domain_list.domain_list.len() == 0 {
             return API::response_error(StatusCode::NOT_FOUND, "Not found");
         }
+
+        crate::hostname::apply_to_domain_list(&mut domain_list.domain_list);
+
         let body = api_msg_gen_domain(&domain_list.domain_list[0]);
 
         API::response_build(StatusCode::OK, body)
@@ -629,7 +632,7 @@ impl API {
         let domain_filter_mode = API::params_get_value(&params, "domain_filter_mode");
         let domain_type = API::params_get_value(&params, "domain_type");
         let domain_group = API::params_get_value(&params, "domain_group");
-        let client = API::params_get_value(&params, "client");
+        let client: Option<String> = API::params_get_value(&params, "client");
         let reply_code = API::params_get_value(&params, "reply_code");
         let order = API::params_get_value(&params, "order");
         let is_blocked = API::params_get_value(&params, "is_blocked");
@@ -653,7 +656,21 @@ impl API {
         param.domain_filter_mode = domain_filter_mode;
         param.domain_type = domain_type;
         param.domain_group = domain_group;
-        param.client = client;
+        // Resolve the client filter to every IP it may correspond to:
+        // "localhost" expands to the loopback addrs, a hostname expands to
+        // all IPs known under that name (v4 + v6), anything else is treated
+        // as a plain IP filter.
+        param.client_ips = client.map(|v| {
+            if v.eq_ignore_ascii_case("localhost") {
+                return vec!["127.0.0.1".to_string(), "::1".to_string()];
+            }
+            let ips = crate::hostname::lease_cache().find_ips_by_hostname(&v);
+            if ips.is_empty() {
+                vec![v]
+            } else {
+                ips
+            }
+        });
         param.reply_code = reply_code;
         param.order = order;
         param.is_blocked = is_blocked;
@@ -697,7 +714,8 @@ impl API {
             return API::response_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string().as_str());
         }
 
-        let domain_list = ret.unwrap();
+        let mut domain_list = ret.unwrap();
+        crate::hostname::apply_to_domain_list(&mut domain_list.domain_list);
         let list_count = domain_list.total_count;
         let mut total_page = list_count / page_size;
         if list_count % page_size != 0 {
@@ -822,7 +840,19 @@ impl API {
             return API::response_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string().as_str());
         }
 
-        let client_list = ret.unwrap();
+        let mut client_list = ret.unwrap();
+        // Backfill display-only hostnames for rows whose column is still
+        // empty (the startup one-shot writes these to the db, this is just
+        // a safety net for clients seen after that).
+        for client in client_list.client_list.iter_mut() {
+            if client.hostname.is_empty() {
+                let name = crate::hostname::display_name(&client.client_ip);
+                if name != client.client_ip {
+                    client.hostname = name;
+                }
+            }
+        }
+
         let list_count = client_list.total_count;
         let mut total_page = list_count / page_size;
         if list_count % page_size != 0 {
@@ -1029,7 +1059,12 @@ impl API {
             return API::response_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string().as_str());
         }
 
-        let body = api_msg_gen_top_client_list(&ret.unwrap());
+        let mut top_list = ret.unwrap();
+        for item in top_list.iter_mut() {
+            item.client_ip = crate::hostname::display_name(&item.client_ip);
+        }
+
+        let body = api_msg_gen_top_client_list(&top_list);
         API::response_build(StatusCode::OK, body)
     }
 

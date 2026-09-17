@@ -336,6 +336,78 @@ impl DataServer {
             return Err(e);
         }
 
+        // Warm up the hostname cache with persisted ip->mac pairs so that
+        // historical query logs resolve hostnames for clients that are not
+        // querying right now (IPv6 clients in particular: the lease file is
+        // IPv4-only, but the client table remembers their MAC).
+        match self.db.get_client_ip_mac_pairs() {
+            Ok(pairs) => {
+                let count = pairs.len();
+                let cache = crate::hostname::lease_cache();
+                for (ip, mac) in pairs {
+                    cache.note_client(&ip, &mac);
+                }
+                dns_log!(
+                    LogLevel::INFO,
+                    "hostname cache warmup: {} client entries loaded",
+                    count
+                );
+            }
+            Err(e) => {
+                dns_log!(
+                    LogLevel::INFO,
+                    "hostname cache warmup skipped: {}",
+                    e.to_string()
+                );
+            }
+        }
+
+        // One-shot backfill of the hostname column for rows that were written
+        // before this feature existed, so the clients tab shows and filters by
+        // hostname too. Names are only written when they actually resolve;
+        // unknown clients keep the empty column and stay fallback-safe.
+        match self.db.get_client_rows_without_hostname() {
+            Ok(rows) => {
+                let updates: Vec<(u32, String)> = rows
+                    .iter()
+                    .filter_map(|(id, ip, _mac)| {
+                        let name = crate::hostname::display_name(ip);
+                        if name != *ip {
+                            Some((*id, name))
+                        } else {
+                            None
+                        }
+                    })
+                    .collect();
+                let count = updates.len();
+                if count > 0 {
+                    match self.db.update_client_hostnames(&updates) {
+                        Ok(()) => {
+                            dns_log!(
+                                LogLevel::INFO,
+                                "client hostname backfill: {} rows updated",
+                                count
+                            );
+                        }
+                        Err(e) => {
+                            dns_log!(
+                                LogLevel::INFO,
+                                "client hostname backfill failed: {}",
+                                e.to_string()
+                            );
+                        }
+                    }
+                }
+            }
+            Err(e) => {
+                dns_log!(
+                    LogLevel::INFO,
+                    "client hostname backfill skipped: {}",
+                    e.to_string()
+                );
+            }
+        }
+
         let ret = self.stat.init();
         if let Err(e) = ret {
             return Err(e);
@@ -620,6 +692,10 @@ impl DataServer {
                 }
             }
 
+            // record ip -> hostname so that IPv6 clients can be named through
+            // their MAC (lease files are IPv4-only)
+            crate::hostname::lease_cache().note_client(&client_ip, &mac_str);
+
             let mut pending = this.client_pending_list.lock().unwrap();
             if let Some(existing) = pending.get_mut(&client_ip) {
                 if mac_str != "00:00:00:00:00:00" {
@@ -630,7 +706,9 @@ impl DataServer {
                 let client_data = ClientData {
                     id: 0,
                     client_ip: client_ip.clone(),
-                    hostname: "".to_string(),
+                    hostname: crate::hostname::lease_cache()
+                        .get(&client_ip)
+                        .unwrap_or_default(),
                     mac: mac_str,
                     last_query_timestamp: timestamp_now,
                 };
