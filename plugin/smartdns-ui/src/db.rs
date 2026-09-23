@@ -109,6 +109,105 @@ pub struct HourlyDetail {
     pub hourly_detail: Vec<HourlyDetailItem>,
 }
 
+/// `domain_hourly_detail` 表里 (小时, 域名分组) 的一行汇总。
+///
+/// 命中 / 未命中的耗时存的是「求和 + 条数」，平均值在读取时相除得到。
+/// 这样同一小时被重复汇总时可以直接覆盖（幂等），不会把平均值越算越偏。
+#[derive(Debug, Clone, Default)]
+pub struct HourlyDetailGroupAgg {
+    pub hour_timestamp: u64,
+    pub domain_group: String,
+    pub query_count: u64,
+    pub cached_count: u64,
+    pub blocked_count: u64,
+    pub cached_time_sum: f64,
+    pub cached_time_count: u64,
+    pub uncached_time_sum: f64,
+    pub uncached_time_count: u64,
+}
+
+/// 一小时的毫秒数。
+const HOURLY_DETAIL_HOUR_MS: u64 = 3_600_000;
+
+/// 每小时汇总时固定重算的已完成小时数（兜住明细延迟入库的情况）。
+const HOURLY_DETAIL_RECHECK_HOURS: u64 = 3;
+
+/// 计算时间戳所属「本地小时」起点的毫秒值（UTC 纪元）。
+///
+/// 与 `insert_domain()` 里维护 `domain_hourly_count` 的算法保持一致：
+/// 先加本地时区偏移、向整点取整，再减掉时区偏移。
+fn local_hour_start_ms(timestamp_ms: u64, local_offset_secs: i64) -> u64 {
+    let offset_ms = local_offset_secs * 1000;
+    let local = timestamp_ms as i64 + offset_ms;
+    let hour_local = local - local.rem_euclid(HOURLY_DETAIL_HOUR_MS as i64);
+    (hour_local - offset_ms) as u64
+}
+
+/// 用与旧实现完全相同的 strftime 表达式格式化小时字符串，保证输出一字不差。
+fn format_local_hour(conn: &Connection, hour_timestamp: u64) -> Result<String, Box<dyn Error>> {
+    let ret = conn.query_row(
+        "SELECT strftime('%Y-%m-%d %H:00:00', datetime(?1 / 1000, 'unixepoch', 'localtime'))",
+        [hour_timestamp as i64],
+        |row| row.get::<_, Option<String>>(0),
+    )?;
+
+    Ok(ret.unwrap_or_default())
+}
+
+/// 扫描 `[start_ms, end_ms)` 内的查询明细，按 (本地小时, 域名分组) 汇总。
+///
+/// 返回 (汇总结果, 扫描到的明细行数)。异常行直接跳过，语义与旧实现一致。
+fn collect_hourly_detail_aggs(
+    conn: &Connection,
+    start_ms: u64,
+    end_ms: u64,
+    local_offset_secs: i64,
+) -> Result<(HashMap<(u64, String), HourlyDetailGroupAgg>, u64), Box<dyn Error>> {
+    let mut aggs: HashMap<(u64, String), HourlyDetailGroupAgg> = HashMap::new();
+    let mut scanned: u64 = 0;
+    let scan_end = end_ms.min(i64::MAX as u64) as i64;
+
+    let mut stmt = conn.prepare(
+        "SELECT timestamp, domain_group, is_cached, is_blocked, query_time \
+         FROM domain WHERE timestamp >= ?1 AND timestamp < ?2",
+    )?;
+    let mut rows = stmt.query(rusqlite::params![start_ms as i64, scan_end])?;
+
+    while let Some(row) = rows.next()? {
+        let timestamp: i64 = row.get(0)?;
+        let domain_group: String = row.get(1)?;
+        let is_cached: i64 = row.get::<_, Option<i64>>(2)?.unwrap_or(0);
+        let is_blocked: i64 = row.get::<_, Option<i64>>(3)?.unwrap_or(0);
+        let query_time: f64 = row.get::<_, Option<f64>>(4)?.unwrap_or(0.0);
+
+        let hour_timestamp = local_hour_start_ms(timestamp.max(0) as u64, local_offset_secs);
+        let agg = aggs
+            .entry((hour_timestamp, domain_group))
+            .or_insert_with_key(|key| HourlyDetailGroupAgg {
+                hour_timestamp: key.0,
+                domain_group: key.1.clone(),
+                ..Default::default()
+            });
+
+        agg.query_count += 1;
+        if is_cached != 0 {
+            agg.cached_count += 1;
+            agg.cached_time_sum += query_time;
+            agg.cached_time_count += 1;
+        } else {
+            agg.uncached_time_sum += query_time;
+            agg.uncached_time_count += 1;
+        }
+        if is_blocked != 0 {
+            agg.blocked_count += 1;
+        }
+        scanned += 1;
+    }
+
+    Ok((aggs, scanned))
+}
+
+
 #[derive(Debug, Clone)]
 pub struct DomainData {
     pub id: u64,
@@ -282,6 +381,8 @@ impl DB {
             [],
         )?;
 
+        self.create_hourly_detail_table(conn)?;
+
         conn.execute(
             "CREATE TABLE IF NOT EXISTS top_domain_list (
                 domain TEXT PRIMARY KEY,
@@ -344,6 +445,31 @@ impl DB {
         Ok(())
     }
 
+    /// 新建「按小时 + 域名分组」的汇总表（幂等，只 CREATE TABLE IF NOT EXISTS）。
+    ///
+    /// 这是在 `create_table()` 之外单独抽出来的：存量数据库打开时**不会**走
+    /// `init_db()`/`create_table()`（只有数据库文件不存在时才会），所以必须在
+    /// `open()` 里显式补建这张新表，否则老库上读不到汇总数据。
+    fn create_hourly_detail_table(&self, conn: &Connection) -> Result<()> {
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS domain_hourly_detail (
+                hour_timestamp BIGINT NOT NULL,
+                domain_group TEXT NOT NULL,
+                query_count INTEGER DEFAULT 0,
+                cached_count INTEGER DEFAULT 0,
+                blocked_count INTEGER DEFAULT 0,
+                cached_time_sum REAL DEFAULT 0,
+                cached_time_count INTEGER DEFAULT 0,
+                uncached_time_sum REAL DEFAULT 0,
+                uncached_time_count INTEGER DEFAULT 0,
+                PRIMARY KEY (hour_timestamp, domain_group)
+            )",
+            [],
+        )?;
+
+        Ok(())
+    }
+
     fn migrate_db(&self, _conn: &Connection) -> Result<(), Box<dyn Error>> {
         return Err(
             "Currently Not Support Migrate Database, Please Backup DB File, And Restart Server."
@@ -396,6 +522,11 @@ impl DB {
             *conn = Some(ruconn);
         } else {
             *conn = Some(ruconn.unwrap());
+        }
+
+        // 存量数据库不会走 init_db()/create_table()，这里补建新增的汇总表。
+        if let Some(conn) = conn.as_ref() {
+            self.create_hourly_detail_table(conn)?;
         }
 
         conn.as_ref()
@@ -1259,130 +1390,325 @@ impl DB {
 
     /// 按小时汇总最近 past_hours 小时的查询明细。
     ///
-    /// 数据取自原始 domain 表（保留期由 max-query-log-age 决定，默认 24 小时），
-    /// 因此「缓存命中 / 被拦截 / 耗时拆分 / 域名分组」这些维度只在原始日志保留期内有效。
-    /// 按小时汇总最近 past_hours 小时的查询明细。
+    /// 数据来自两张表：
+    /// - **已结束的小时**：直接读 `domain_hourly_detail` 汇总表（每个 (小时, 分组) 一行），
+    ///   不再扫描 24 小时明细，这是本次优化的关键；
+    /// - **实时部分**：窗口最早那个被 `now - past_hours` 截断的小时，以及「当前还没结束的小时」，
+    ///   仍然实时扫明细（各一千到几千行），保证最新一根柱子和边界口径与旧实现一致。
     ///
-    /// 只对 domain 表做**一次**聚合扫描：SQL 按 (小时, 域名分组) 分组返回，
-    /// 小时级的命中/拦截/平均耗时在内存里由分组结果加权合并得到。
-    /// 改造前是两条 GROUP BY 各扫一遍（实测单次调用约 290ms，合并后约 150ms）。
+    /// 返回结构（字段名 / 类型 / 数量）与逐条扫明细的旧实现完全相同。
     pub fn get_hourly_detail(&self, past_hours: u32) -> Result<HourlyDetail, Box<dyn Error>> {
-        struct HourAgg {
-            cached_time_sum: f64,
-            uncached_time_sum: f64,
-            cached_count: u64,
-            uncached_count: u64,
-        }
+        let now_ms = smartdns::get_utc_time_ms();
+        let local_offset = Local::now().offset().local_minus_utc() as i64;
+        let current_hour = local_hour_start_ms(now_ms, local_offset);
+        let mut window_start =
+            now_ms.saturating_sub(HOURLY_DETAIL_HOUR_MS.saturating_mul(past_hours as u64));
 
-        let mut ret: Vec<HourlyDetailItem> = Vec::new();
-        let mut aggs: Vec<HourAgg> = Vec::new();
         let conn = self.get_readonly_conn();
-        if conn.as_ref().is_none() {
-            return Err("db is not open".into());
+        let conn = match conn {
+            Some(conn) => conn,
+            None => return Err("db is not open".into()),
+        };
+
+        // 汇总表可能保留 30 天，但旧实现只能看到明细保留期内的小时。
+        // 用明细里最早的一条把窗口夹住，保证输出的小时范围与旧实现完全一致。
+        let detail_min: Option<i64> =
+            conn.query_row("SELECT MIN(timestamp) FROM domain", [], |row| row.get(0))?;
+        let detail_min = match detail_min {
+            Some(v) if v > 0 => v as u64,
+            _ => {
+                return Ok(HourlyDetail {
+                    query_timestamp: now_ms,
+                    hourly_detail: Vec::new(),
+                });
+            }
+        };
+        if detail_min > window_start {
+            window_start = detail_min;
         }
 
-        let conn = conn.as_ref().unwrap();
-        let seconds = 3600 * past_hours;
+        let boundary_hour = local_hour_start_ms(window_start, local_offset);
+        let mut hours: HashMap<u64, Vec<HourlyDetailGroupAgg>> = HashMap::new();
 
-        let detail_sql = "SELECT \
-                    strftime('%Y-%m-%d %H:00:00', datetime(timestamp / 1000, 'unixepoch', 'localtime')) AS hour, \
-                    domain_group, \
-                    COUNT(*) AS query_count, \
-                    SUM(is_cached) AS cached_count, \
-                    SUM(is_blocked) AS blocked_count, \
-                    SUM(CASE WHEN is_cached = 1 THEN query_time ELSE 0 END) AS cached_time_sum, \
-                    SUM(CASE WHEN is_cached = 0 THEN query_time ELSE 0 END) AS uncached_time_sum \
-                 FROM \
-                    domain \
-                 WHERE \
-                    timestamp >= strftime('%s', 'now') * 1000 - ? * 1000 \
-                 GROUP BY \
-                    hour, domain_group \
-                 ORDER BY \
-                    hour DESC;";
-        self.debug_query_plan(conn, detail_sql.to_string(), &vec![seconds.to_string()]);
-
-        let mut index_of: HashMap<String, usize> = HashMap::new();
-        {
-            let mut stmt = conn.prepare(detail_sql)?;
-            let rows = stmt.query_map([seconds.to_string()], |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, String>(1)?,
-                    row.get::<_, Option<i64>>(2)?.unwrap_or(0),
-                    row.get::<_, Option<i64>>(3)?.unwrap_or(0),
-                    row.get::<_, Option<i64>>(4)?.unwrap_or(0),
-                    row.get::<_, Option<f64>>(5)?.unwrap_or(0.0),
-                    row.get::<_, Option<f64>>(6)?.unwrap_or(0.0),
-                ))
-            })?;
+        // 1) 已结束的小时：读汇总表（只读十几行到几十行）
+        if boundary_hour < current_hour {
+            let stored_from = boundary_hour + HOURLY_DETAIL_HOUR_MS;
+            let mut stmt = conn.prepare(
+                "SELECT hour_timestamp, domain_group, query_count, cached_count, blocked_count, \
+                        cached_time_sum, cached_time_count, uncached_time_sum, uncached_time_count \
+                 FROM domain_hourly_detail \
+                 WHERE hour_timestamp >= ?1 AND hour_timestamp < ?2",
+            )?;
+            let rows = stmt.query_map(
+                rusqlite::params![stored_from as i64, current_hour as i64],
+                |row| {
+                    let to_u64 = |v: Option<i64>| v.unwrap_or(0).max(0) as u64;
+                    Ok(HourlyDetailGroupAgg {
+                        hour_timestamp: row.get::<_, i64>(0)?.max(0) as u64,
+                        domain_group: row.get(1)?,
+                        query_count: to_u64(row.get::<_, Option<i64>>(2)?),
+                        cached_count: to_u64(row.get::<_, Option<i64>>(3)?),
+                        blocked_count: to_u64(row.get::<_, Option<i64>>(4)?),
+                        cached_time_sum: row.get::<_, Option<f64>>(5)?.unwrap_or(0.0),
+                        cached_time_count: to_u64(row.get::<_, Option<i64>>(6)?),
+                        uncached_time_sum: row.get::<_, Option<f64>>(7)?.unwrap_or(0.0),
+                        uncached_time_count: to_u64(row.get::<_, Option<i64>>(8)?),
+                    })
+                },
+            )?;
 
             for row in rows {
-                let (hour, domain_group, query_count, cached_count, blocked_count, cached_time_sum, uncached_time_sum) =
-                    match row {
-                        Ok(row) => row,
-                        Err(e) => {
-                            dns_log!(LogLevel::DEBUG, "get_hourly_detail row error: {}", e);
-                            continue;
-                        }
-                    };
-
-                let idx = if let Some(idx) = index_of.get(hour.as_str()).copied() {
-                    idx
-                } else {
-                    let idx = ret.len();
-                    index_of.insert(hour.clone(), idx);
-                    ret.push(HourlyDetailItem {
-                        hour,
-                        query_count: 0,
-                        cached_count: 0,
-                        blocked_count: 0,
-                        avg_query_time_cached: 0.0,
-                        avg_query_time_uncached: 0.0,
-                        groups: Vec::new(),
-                    });
-                    aggs.push(HourAgg {
-                        cached_time_sum: 0.0,
-                        uncached_time_sum: 0.0,
-                        cached_count: 0,
-                        uncached_count: 0,
-                    });
-                    idx
-                };
-
-                if let Some(item) = ret.get_mut(idx) {
-                    item.query_count = item.query_count.saturating_add(query_count as u32);
-                    item.cached_count = item.cached_count.saturating_add(cached_count as u32);
-                    item.blocked_count = item.blocked_count.saturating_add(blocked_count as u32);
-                    item.groups.push(DomainGroupHourlyStat {
-                        domain_group,
-                        query_count: query_count as u32,
-                        cached_count: cached_count as u32,
-                    });
-                }
-
-                if let Some(agg) = aggs.get_mut(idx) {
-                    agg.cached_time_sum += cached_time_sum;
-                    agg.uncached_time_sum += uncached_time_sum;
-                    agg.cached_count += cached_count.max(0) as u64;
-                    agg.uncached_count += (query_count - cached_count).max(0) as u64;
-                }
+                let agg = row?;
+                hours.entry(agg.hour_timestamp).or_default().push(agg);
             }
         }
 
-        for (item, agg) in ret.iter_mut().zip(aggs.iter()) {
-            if agg.cached_count > 0 {
-                item.avg_query_time_cached = agg.cached_time_sum / agg.cached_count as f64;
+        // 2) 实时部分：窗口最早那个被截断的小时 + 当前这个还没结束的小时
+        let mut live_ranges: Vec<(u64, u64)> = Vec::new();
+        if boundary_hour < current_hour {
+            live_ranges.push((window_start, boundary_hour + HOURLY_DETAIL_HOUR_MS));
+            live_ranges.push((current_hour, u64::MAX));
+        } else {
+            live_ranges.push((window_start, u64::MAX));
+        }
+
+        for (start, end) in live_ranges {
+            if start >= end {
+                continue;
             }
-            if agg.uncached_count > 0 {
-                item.avg_query_time_uncached = agg.uncached_time_sum / agg.uncached_count as f64;
+            let (aggs, _) = collect_hourly_detail_aggs(&conn, start, end, local_offset)?;
+            for ((hour_timestamp, _domain_group), agg) in aggs {
+                hours.entry(hour_timestamp).or_default().push(agg);
             }
+        }
+
+        // 3) 兜底：整点汇总的任务可能正在跑（或刚重启、首次运行），
+        //    上一个已完成的小时此时还没落表，就地实时补算这一个小时，
+        //    避免图上短时间少一根柱子。正常情况下汇总表里已有，不会走这里。
+        let last_completed_hour = current_hour.saturating_sub(HOURLY_DETAIL_HOUR_MS);
+        if last_completed_hour >= boundary_hour && !hours.contains_key(&last_completed_hour) {
+            let (aggs, _) = collect_hourly_detail_aggs(
+                &conn,
+                last_completed_hour,
+                current_hour,
+                local_offset,
+            )?;
+            for ((hour_timestamp, _domain_group), agg) in aggs {
+                hours.entry(hour_timestamp).or_default().push(agg);
+            }
+        }
+
+        // 4) 组装输出：小时倒序（与旧实现 ORDER BY hour DESC 一致），
+        //    同一小时内按域名分组名升序（与旧实现 GROUP BY 的返回顺序一致）。
+        let mut ordered: Vec<(u64, Vec<HourlyDetailGroupAgg>)> = hours.into_iter().collect();
+        ordered.sort_by(|a, b| b.0.cmp(&a.0));
+
+        let mut ret: Vec<HourlyDetailItem> = Vec::with_capacity(ordered.len());
+        for (hour_timestamp, mut groups) in ordered {
+            groups.sort_by(|a, b| a.domain_group.cmp(&b.domain_group));
+
+            let mut item = HourlyDetailItem {
+                hour: format_local_hour(&conn, hour_timestamp)?,
+                query_count: 0,
+                cached_count: 0,
+                blocked_count: 0,
+                avg_query_time_cached: 0.0,
+                avg_query_time_uncached: 0.0,
+                groups: Vec::new(),
+            };
+            let mut cached_time_sum = 0.0f64;
+            let mut cached_time_count = 0u64;
+            let mut uncached_time_sum = 0.0f64;
+            let mut uncached_time_count = 0u64;
+
+            for agg in groups {
+                item.query_count = item.query_count.saturating_add(agg.query_count as u32);
+                item.cached_count = item.cached_count.saturating_add(agg.cached_count as u32);
+                item.blocked_count = item.blocked_count.saturating_add(agg.blocked_count as u32);
+                cached_time_sum += agg.cached_time_sum;
+                cached_time_count += agg.cached_time_count;
+                uncached_time_sum += agg.uncached_time_sum;
+                uncached_time_count += agg.uncached_time_count;
+
+                item.groups.push(DomainGroupHourlyStat {
+                    domain_group: agg.domain_group,
+                    query_count: agg.query_count as u32,
+                    cached_count: agg.cached_count as u32,
+                });
+            }
+
+            if cached_time_count > 0 {
+                item.avg_query_time_cached = cached_time_sum / cached_time_count as f64;
+            }
+            if uncached_time_count > 0 {
+                item.avg_query_time_uncached = uncached_time_sum / uncached_time_count as f64;
+            }
+
+            ret.push(item);
         }
 
         Ok(HourlyDetail {
-            query_timestamp: smartdns::get_utc_time_ms(),
+            query_timestamp: now_ms,
             hourly_detail: ret,
         })
+    }
+
+    /// 幂等写入小时汇总表：同一 (小时, 分组) 直接覆盖，不会累加。
+    pub fn upsert_domain_hourly_detail(
+        &self,
+        aggs: &[HourlyDetailGroupAgg],
+    ) -> Result<(), Box<dyn Error>> {
+        if aggs.is_empty() {
+            return Ok(());
+        }
+
+        let mut conn = self.conn.lock().unwrap();
+        if conn.as_ref().is_none() {
+            return Err("db is not open".into());
+        }
+        let conn = conn.as_mut().unwrap();
+        let tx = conn.transaction()?;
+        {
+            let mut stmt = tx.prepare(
+                "INSERT INTO domain_hourly_detail \
+                 (hour_timestamp, domain_group, query_count, cached_count, blocked_count, \
+                  cached_time_sum, cached_time_count, uncached_time_sum, uncached_time_count) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9) \
+                 ON CONFLICT(hour_timestamp, domain_group) DO UPDATE SET \
+                  query_count = excluded.query_count, \
+                  cached_count = excluded.cached_count, \
+                  blocked_count = excluded.blocked_count, \
+                  cached_time_sum = excluded.cached_time_sum, \
+                  cached_time_count = excluded.cached_time_count, \
+                  uncached_time_sum = excluded.uncached_time_sum, \
+                  uncached_time_count = excluded.uncached_time_count",
+            )?;
+
+            for agg in aggs {
+                stmt.execute(rusqlite::params![
+                    agg.hour_timestamp as i64,
+                    &agg.domain_group,
+                    agg.query_count as i64,
+                    agg.cached_count as i64,
+                    agg.blocked_count as i64,
+                    agg.cached_time_sum,
+                    agg.cached_time_count as i64,
+                    agg.uncached_time_sum,
+                    agg.uncached_time_count as i64,
+                ])?;
+            }
+        }
+        tx.commit()?;
+
+        Ok(())
+    }
+
+    /// 汇总 `[start_ms, end_ms)` 的明细并幂等落库，返回扫描到的明细行数。
+    pub fn summarize_hourly_detail(
+        &self,
+        start_ms: u64,
+        end_ms: u64,
+    ) -> Result<u64, Box<dyn Error>> {
+        if start_ms >= end_ms {
+            return Ok(0);
+        }
+
+        let local_offset = Local::now().offset().local_minus_utc() as i64;
+        let (aggs, scanned) = {
+            let conn = self.get_readonly_conn();
+            let conn = match conn {
+                Some(conn) => conn,
+                None => return Err("db is not open".into()),
+            };
+            collect_hourly_detail_aggs(&conn, start_ms, end_ms, local_offset)?
+        };
+
+        let mut rows: Vec<HourlyDetailGroupAgg> = aggs.into_values().collect();
+        rows.sort_by(|a, b| {
+            a.hour_timestamp
+                .cmp(&b.hour_timestamp)
+                .then_with(|| a.domain_group.cmp(&b.domain_group))
+        });
+        self.upsert_domain_hourly_detail(&rows)?;
+
+        Ok(scanned)
+    }
+
+    /// 汇总表里最早 / 最晚的小时桶（没有任何汇总时返回 (None, None)）。
+    pub fn get_hourly_detail_hour_range(
+        &self,
+    ) -> Result<(Option<u64>, Option<u64>), Box<dyn Error>> {
+        let conn = self.get_readonly_conn();
+        let conn = match conn {
+            Some(conn) => conn,
+            None => return Err("db is not open".into()),
+        };
+
+        let ret = conn.query_row(
+            "SELECT MIN(hour_timestamp), MAX(hour_timestamp) FROM domain_hourly_detail",
+            [],
+            |row| {
+                Ok((
+                    row.get::<_, Option<i64>>(0)?,
+                    row.get::<_, Option<i64>>(1)?,
+                ))
+            },
+        )?;
+
+        Ok((
+            ret.0.map(|v| v.max(0) as u64),
+            ret.1.map(|v| v.max(0) as u64),
+        ))
+    }
+
+    /// 整点跑一次的小时汇总入口。
+    ///
+    /// 正常情况下只重算最近 `HOURLY_DETAIL_RECHECK_HOURS` 个已完成小时（幂等覆盖）；
+    /// 首次运行、或发现表里历史有缺口时，按明细保留期把已完成小时整体回填一遍。
+    /// 当前这个还没结束的小时**不落库**，由接口实时计算。
+    pub fn refresh_hourly_detail(
+        &self,
+        now_ms: u64,
+        retention_ms: u64,
+    ) -> Result<u64, Box<dyn Error>> {
+        let local_offset = Local::now().offset().local_minus_utc() as i64;
+        let current_hour = local_hour_start_ms(now_ms, local_offset);
+        let backfill_hour = local_hour_start_ms(now_ms.saturating_sub(retention_ms), local_offset);
+        let recheck_hour =
+            current_hour.saturating_sub(HOURLY_DETAIL_RECHECK_HOURS * HOURLY_DETAIL_HOUR_MS);
+
+        let covered = match self.get_hourly_detail_hour_range()? {
+            (Some(min), Some(max)) => {
+                min <= backfill_hour.saturating_add(HOURLY_DETAIL_HOUR_MS)
+                    && max.saturating_add(HOURLY_DETAIL_HOUR_MS) >= recheck_hour
+            }
+            _ => false,
+        };
+        let start_hour = if covered { recheck_hour } else { backfill_hour };
+        if start_hour >= current_hour {
+            return Ok(0);
+        }
+
+        self.summarize_hourly_detail(start_hour, current_hour)
+    }
+
+    /// 清理 30 天以前的小时汇总（明细本身只有 24 小时，这里留宽一点方便以后扩展）。
+    pub fn delete_hourly_detail_before_timestamp(
+        &self,
+        timestamp: u64,
+    ) -> Result<u64, Box<dyn Error>> {
+        let conn = self.conn.lock().unwrap();
+        if conn.as_ref().is_none() {
+            return Err("db is not open".into());
+        }
+        let conn = conn.as_ref().unwrap();
+
+        let ret = conn.execute(
+            "DELETE FROM domain_hourly_detail WHERE hour_timestamp <= ?",
+            [timestamp as i64],
+        )?;
+
+        Ok(ret as u64)
     }
 
     pub fn refresh_domain_top_list(&self, timestamp: u64) -> Result<(), Box<dyn Error>> {
