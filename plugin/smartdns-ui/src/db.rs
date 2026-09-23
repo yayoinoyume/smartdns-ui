@@ -86,6 +86,30 @@ pub struct DailyQueryCount {
 }
 
 #[derive(Debug, Clone)]
+pub struct DomainGroupHourlyStat {
+    pub domain_group: String,
+    pub query_count: u32,
+    pub cached_count: u32,
+}
+
+#[derive(Debug, Clone)]
+pub struct HourlyDetailItem {
+    pub hour: String,
+    pub query_count: u32,
+    pub cached_count: u32,
+    pub blocked_count: u32,
+    pub avg_query_time_cached: f64,
+    pub avg_query_time_uncached: f64,
+    pub groups: Vec<DomainGroupHourlyStat>,
+}
+
+#[derive(Debug, Clone)]
+pub struct HourlyDetail {
+    pub query_timestamp: u64,
+    pub hourly_detail: Vec<HourlyDetailItem>,
+}
+
+#[derive(Debug, Clone)]
 pub struct DomainData {
     pub id: u64,
     pub timestamp: u64,
@@ -1230,6 +1254,110 @@ impl DB {
         Ok(HourlyQueryCount {
             query_timestamp: smartdns::get_utc_time_ms(),
             hourly_query_count: ret,
+        })
+    }
+
+    /// 按小时汇总最近 past_hours 小时的查询明细。
+    ///
+    /// 数据取自原始 domain 表（保留期由 max-query-log-age 决定，默认 24 小时），
+    /// 因此「缓存命中 / 被拦截 / 耗时拆分 / 域名分组」这些维度只在原始日志保留期内有效。
+    pub fn get_hourly_detail(&self, past_hours: u32) -> Result<HourlyDetail, Box<dyn Error>> {
+        let mut ret: Vec<HourlyDetailItem> = Vec::new();
+        let conn = self.get_readonly_conn();
+        if conn.as_ref().is_none() {
+            return Err("db is not open".into());
+        }
+
+        let conn = conn.as_ref().unwrap();
+        let seconds = 3600 * past_hours;
+
+        let hour_sql = "SELECT \
+                    strftime('%Y-%m-%d %H:00:00', datetime(timestamp / 1000, 'unixepoch', 'localtime')) AS hour, \
+                    COUNT(*) AS query_count, \
+                    SUM(is_cached) AS cached_count, \
+                    SUM(is_blocked) AS blocked_count, \
+                    AVG(CASE WHEN is_cached = 1 THEN query_time END) AS avg_cached, \
+                    AVG(CASE WHEN is_cached = 0 THEN query_time END) AS avg_uncached \
+                 FROM \
+                    domain \
+                 WHERE \
+                    timestamp >= strftime('%s', 'now') * 1000 - ? * 1000 \
+                 GROUP BY \
+                    hour \
+                 ORDER BY \
+                    hour DESC;";
+        self.debug_query_plan(conn, hour_sql.to_string(), &vec![seconds.to_string()]);
+
+        let mut index_of: HashMap<String, usize> = HashMap::new();
+        {
+            let mut stmt = conn.prepare(hour_sql)?;
+            let rows = stmt.query_map([seconds.to_string()], |row| {
+                Ok(HourlyDetailItem {
+                    hour: row.get::<_, String>(0)?,
+                    query_count: row.get::<_, Option<i64>>(1)?.unwrap_or(0) as u32,
+                    cached_count: row.get::<_, Option<i64>>(2)?.unwrap_or(0) as u32,
+                    blocked_count: row.get::<_, Option<i64>>(3)?.unwrap_or(0) as u32,
+                    avg_query_time_cached: row.get::<_, Option<f64>>(4)?.unwrap_or(0.0),
+                    avg_query_time_uncached: row.get::<_, Option<f64>>(5)?.unwrap_or(0.0),
+                    groups: Vec::new(),
+                })
+            })?;
+
+            for row in rows {
+                match row {
+                    Ok(item) => {
+                        index_of.insert(item.hour.clone(), ret.len());
+                        ret.push(item);
+                    }
+                    Err(e) => {
+                        dns_log!(LogLevel::DEBUG, "get_hourly_detail hour row error: {}", e);
+                    }
+                }
+            }
+        }
+
+        let group_sql = "SELECT \
+                    strftime('%Y-%m-%d %H:00:00', datetime(timestamp / 1000, 'unixepoch', 'localtime')) AS hour, \
+                    domain_group, \
+                    COUNT(*) AS query_count, \
+                    SUM(is_cached) AS cached_count \
+                 FROM \
+                    domain \
+                 WHERE \
+                    timestamp >= strftime('%s', 'now') * 1000 - ? * 1000 \
+                 GROUP BY \
+                    hour, domain_group \
+                 ORDER BY \
+                    hour DESC;";
+        self.debug_query_plan(conn, group_sql.to_string(), &vec![seconds.to_string()]);
+
+        {
+            let mut stmt = conn.prepare(group_sql)?;
+            let rows = stmt.query_map([seconds.to_string()], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    DomainGroupHourlyStat {
+                        domain_group: row.get::<_, String>(1)?,
+                        query_count: row.get::<_, Option<i64>>(2)?.unwrap_or(0) as u32,
+                        cached_count: row.get::<_, Option<i64>>(3)?.unwrap_or(0) as u32,
+                    },
+                ))
+            })?;
+
+            for row in rows {
+                if let Ok((hour, group)) = row {
+                    if let Some(&idx) = index_of.get(hour.as_str()) {
+                        if let Some(item) = ret.get_mut(idx) {
+                            item.groups.push(group);
+                        }
+                    }
+                }
+            }
+        }
+
+        Ok(HourlyDetail {
+            query_timestamp: smartdns::get_utc_time_ms(),
+            hourly_detail: ret,
         })
     }
 
