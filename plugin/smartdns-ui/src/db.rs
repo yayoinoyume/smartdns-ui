@@ -20,7 +20,7 @@ use crate::dns_log;
 use crate::smartdns;
 use crate::smartdns::*;
 use crate::utils;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::error::Error;
 use std::fs;
 use std::sync::Mutex;
@@ -111,8 +111,7 @@ pub struct HourlyDetail {
 
 /// `domain_hourly_detail` 表里 (小时, 域名分组) 的一行汇总。
 ///
-/// 命中 / 未命中的耗时存的是「求和 + 条数」，平均值在读取时相除得到。
-/// 这样同一小时被重复汇总时可以直接覆盖（幂等），不会把平均值越算越偏。
+/// 耗时存「求和 + 条数」，读取时相除得到平均值；这样重复汇总可直接覆盖（幂等）。
 #[derive(Debug, Clone, Default)]
 pub struct HourlyDetailGroupAgg {
     pub hour_timestamp: u64,
@@ -126,16 +125,25 @@ pub struct HourlyDetailGroupAgg {
     pub uncached_time_count: u64,
 }
 
-/// 一小时的毫秒数。
 const HOURLY_DETAIL_HOUR_MS: u64 = 3_600_000;
 
 /// 每小时汇总时固定重算的已完成小时数（兜住明细延迟入库的情况）。
 const HOURLY_DETAIL_RECHECK_HOURS: u64 = 3;
 
+/// 读汇总表（只含已结束的完整小时）。抽成常量，便于 debug_query_plan 复用同一份 SQL。
+const HOURLY_DETAIL_STORED_SQL: &str =
+    "SELECT hour_timestamp, domain_group, query_count, cached_count, blocked_count, \
+     cached_time_sum, cached_time_count, uncached_time_sum, uncached_time_count \
+     FROM domain_hourly_detail WHERE hour_timestamp >= ?1 AND hour_timestamp < ?2";
+
+/// 实时扫明细的 SQL。
+const HOURLY_DETAIL_SCAN_SQL: &str =
+    "SELECT timestamp, domain_group, is_cached, is_blocked, query_time \
+     FROM domain WHERE timestamp >= ?1 AND timestamp < ?2";
+
 /// 计算时间戳所属「本地小时」起点的毫秒值（UTC 纪元）。
 ///
-/// 与 `insert_domain()` 里维护 `domain_hourly_count` 的算法保持一致：
-/// 先加本地时区偏移、向整点取整，再减掉时区偏移。
+/// 与 `insert_domain()` 维护 `domain_hourly_count` 的算法一致（加偏移 → 整点取整 → 减偏移）。
 fn local_hour_start_ms(timestamp_ms: u64, local_offset_secs: i64) -> u64 {
     let offset_ms = local_offset_secs * 1000;
     let local = timestamp_ms as i64 + offset_ms;
@@ -167,10 +175,7 @@ fn collect_hourly_detail_aggs(
     let mut scanned: u64 = 0;
     let scan_end = end_ms.min(i64::MAX as u64) as i64;
 
-    let mut stmt = conn.prepare(
-        "SELECT timestamp, domain_group, is_cached, is_blocked, query_time \
-         FROM domain WHERE timestamp >= ?1 AND timestamp < ?2",
-    )?;
+    let mut stmt = conn.prepare(HOURLY_DETAIL_SCAN_SQL)?;
     let mut rows = stmt.query(rusqlite::params![start_ms as i64, scan_end])?;
 
     while let Some(row) = rows.next()? {
@@ -205,6 +210,122 @@ fn collect_hourly_detail_aggs(
     }
 
     Ok((aggs, scanned))
+}
+
+/// 把一批 (小时, 分组) 汇总追加到「按小时分组」的容器里。
+fn push_hourly_detail_aggs(
+    hours: &mut HashMap<u64, Vec<HourlyDetailGroupAgg>>,
+    aggs: impl IntoIterator<Item = HourlyDetailGroupAgg>,
+) {
+    for agg in aggs {
+        hours.entry(agg.hour_timestamp).or_default().push(agg);
+    }
+}
+
+/// 计算 `get_hourly_detail()` 里必须实时扫明细的区间（不含「汇总表缺小时」的补算）。
+///
+/// 覆盖 `boundary_hour`（窗口起点所在的残段小时，半截、汇总表口径覆盖不到）和
+/// `current_hour`（当前未结束的小时）；`window_start` 是窗口起点毫秒值。
+/// 返回互不重叠的左闭右开区间，残段小时只会出现一次。
+fn hourly_detail_live_ranges(
+    boundary_hour: u64,
+    current_hour: u64,
+    window_start: u64,
+) -> Vec<(u64, u64)> {
+    if boundary_hour < current_hour {
+        vec![
+            (window_start, boundary_hour + HOURLY_DETAIL_HOUR_MS),
+            (current_hour, u64::MAX),
+        ]
+    } else {
+        vec![(window_start, u64::MAX)]
+    }
+}
+
+/// 在 `[first_hour, to_hour)` 里找出汇总表没有、需要就地实时补算的完整小时。
+/// 连续缺失合并成一个区间；表完整时返回空集合。
+fn missing_hour_ranges(present: &HashSet<u64>, first_hour: u64, to_hour: u64) -> Vec<(u64, u64)> {
+    let mut ret: Vec<(u64, u64)> = Vec::new();
+    let mut hour = first_hour;
+    while hour < to_hour {
+        if present.contains(&hour) {
+            hour += HOURLY_DETAIL_HOUR_MS;
+            continue;
+        }
+
+        let start = hour;
+        while hour < to_hour && !present.contains(&hour) {
+            hour += HOURLY_DETAIL_HOUR_MS;
+        }
+        ret.push((start, hour));
+    }
+
+    ret
+}
+
+/// 汇总表是否存在（查 sqlite_master，开销可忽略）。
+/// `open()` 补建失败时靠它整段跳过汇总表读取、退化为实时扫描，而不是报错。
+fn hourly_detail_table_exists(conn: &Connection) -> bool {
+    conn.query_row(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'domain_hourly_detail'",
+        [],
+        |_| Ok(()),
+    )
+    .is_ok()
+}
+
+/// 汇总表里 `[from_hour, to_hour)` 已有的小时集合。
+fn stored_hours_in_range(
+    conn: &Connection,
+    from_hour: u64,
+    to_hour: u64,
+) -> Result<HashSet<u64>, Box<dyn Error>> {
+    let mut stmt = conn.prepare(
+        "SELECT DISTINCT hour_timestamp FROM domain_hourly_detail \
+         WHERE hour_timestamp >= ?1 AND hour_timestamp < ?2",
+    )?;
+    let rows = stmt.query_map(
+        rusqlite::params![from_hour as i64, to_hour as i64],
+        |row| row.get::<_, i64>(0),
+    )?;
+
+    let mut ret = HashSet::new();
+    for row in rows {
+        ret.insert(row?.max(0) as u64);
+    }
+
+    Ok(ret)
+}
+
+/// 明细里 `[from_hour, to_hour)` 出现过数据的小时集合。
+/// 与 `local_hour_start_ms()` 同一「本地整点」口径，走 idx_domain_timestamp 索引。
+fn detail_hours_in_range(
+    conn: &Connection,
+    from_hour: u64,
+    to_hour: u64,
+    local_offset_secs: i64,
+) -> Result<HashSet<u64>, Box<dyn Error>> {
+    let offset_ms = local_offset_secs * 1000;
+    let mut stmt = conn.prepare(
+        "SELECT DISTINCT (timestamp + ?1) / ?2 * ?2 - ?1 AS hour \
+         FROM domain WHERE timestamp >= ?3 AND timestamp < ?4",
+    )?;
+    let rows = stmt.query_map(
+        rusqlite::params![
+            offset_ms,
+            HOURLY_DETAIL_HOUR_MS as i64,
+            from_hour as i64,
+            to_hour as i64
+        ],
+        |row| row.get::<_, i64>(0),
+    )?;
+
+    let mut ret = HashSet::new();
+    for row in rows {
+        ret.insert(row?.max(0) as u64);
+    }
+
+    Ok(ret)
 }
 
 
@@ -447,9 +568,8 @@ impl DB {
 
     /// 新建「按小时 + 域名分组」的汇总表（幂等，只 CREATE TABLE IF NOT EXISTS）。
     ///
-    /// 这是在 `create_table()` 之外单独抽出来的：存量数据库打开时**不会**走
-    /// `init_db()`/`create_table()`（只有数据库文件不存在时才会），所以必须在
-    /// `open()` 里显式补建这张新表，否则老库上读不到汇总数据。
+    /// 必须在 `open()` 里单独补建：存量数据库不会走 `init_db()`/`create_table()`
+    /// （只有库文件不存在时才会），否则老库上读不到汇总数据。
     fn create_hourly_detail_table(&self, conn: &Connection) -> Result<()> {
         conn.execute(
             "CREATE TABLE IF NOT EXISTS domain_hourly_detail (
@@ -468,6 +588,35 @@ impl DB {
         )?;
 
         Ok(())
+    }
+
+    /// 尽力保证汇总表存在：失败只告警并返回 false，绝不影响插件启动 / 加载。
+    fn ensure_hourly_detail_table_locked(&self, conn: &Connection) -> bool {
+        if hourly_detail_table_exists(conn) {
+            return true;
+        }
+
+        match self.create_hourly_detail_table(conn) {
+            Ok(_) => true,
+            Err(e) => {
+                dns_log!(
+                    LogLevel::WARN,
+                    "create table domain_hourly_detail failed: {}, hourly-detail falls back to live scan",
+                    e
+                );
+                false
+            }
+        }
+    }
+
+    /// 同 `ensure_hourly_detail_table_locked()`，但自己拿 `self.conn` 的锁
+    /// （调用方必须没有持有该锁）。
+    fn ensure_hourly_detail_table(&self) -> bool {
+        let conn = self.conn.lock().unwrap();
+        match conn.as_ref() {
+            Some(conn) => self.ensure_hourly_detail_table_locked(conn),
+            None => false,
+        }
     }
 
     fn migrate_db(&self, _conn: &Connection) -> Result<(), Box<dyn Error>> {
@@ -524,9 +673,10 @@ impl DB {
             *conn = Some(ruconn.unwrap());
         }
 
-        // 存量数据库不会走 init_db()/create_table()，这里补建新增的汇总表。
+        // 存量库不会走 init_db()/create_table()，这里补建汇总表（见 create_hourly_detail_table）。
+        // 建表失败不能让插件起不来（这条路径还挂着主机名、日志和所有接口），所以只告警。
         if let Some(conn) = conn.as_ref() {
-            self.create_hourly_detail_table(conn)?;
+            self.ensure_hourly_detail_table_locked(conn);
         }
 
         conn.as_ref()
@@ -852,6 +1002,14 @@ impl DB {
 
         let conn = conn.as_ref().unwrap();
         conn.path().map(|v| v.to_string())
+    }
+
+    /// 取一个只读连接；数据库未打开时返回 `db is not open` 错误。
+    fn readonly_conn_or_err(&self) -> Result<Connection, Box<dyn Error>> {
+        match self.get_readonly_conn() {
+            Some(conn) => Ok(conn),
+            None => Err("db is not open".into()),
+        }
     }
 
     pub fn get_readonly_conn(&self) -> Option<Connection> {
@@ -1219,12 +1377,7 @@ impl DB {
 
     pub fn get_client_top_list(&self, count: u32) -> Result<Vec<ClientQueryCount>, Box<dyn Error>> {
         let mut ret = Vec::new();
-        let conn = self.get_readonly_conn();
-        if conn.as_ref().is_none() {
-            return Err("db is not open".into());
-        }
-
-        let conn = conn.as_ref().unwrap();
+        let conn = self.readonly_conn_or_err()?;
         let mut stmt =
             conn.prepare("SELECT client, count, timestamp_start, timestamp_end FROM top_client_list ORDER BY count DESC LIMIT ?")?;
         let rows = stmt.query_map([count.to_string()], |row| {
@@ -1272,12 +1425,7 @@ impl DB {
 
     pub fn get_daily_query_count(&self, past_days: u32) -> Result<DailyQueryCount, Box<dyn Error>> {
         let mut ret = Vec::new();
-        let conn = self.get_readonly_conn();
-        if conn.as_ref().is_none() {
-            return Err("db is not open".into());
-        }
-
-        let conn = conn.as_ref().unwrap();
+        let conn = self.readonly_conn_or_err()?;
         let seconds = 86400 * past_days - utils::seconds_until_next_hour() as u32;
         let mut stmt = conn.prepare(
             "SELECT \
@@ -1340,13 +1488,9 @@ impl DB {
         past_hours: u32,
     ) -> Result<HourlyQueryCount, Box<dyn Error>> {
         let mut ret = Vec::new();
-        let conn = self.get_readonly_conn();
-        if conn.as_ref().is_none() {
-            return Err("db is not open".into());
-        }
+        let conn = self.readonly_conn_or_err()?;
 
         let query_start = std::time::Instant::now();
-        let conn = conn.as_ref().unwrap();
         let seconds = 3600 * past_hours - utils::seconds_until_next_hour() as u32;
 
         let sql = "SELECT \
@@ -1358,7 +1502,7 @@ impl DB {
                  ORDER BY \
                     timestamp DESC;\
                  ";
-        self.debug_query_plan(conn, sql.to_string(), &vec![seconds.to_string()]);
+        self.debug_query_plan(&conn, sql.to_string(), &vec![seconds.to_string()]);
         let mut stmt = conn.prepare(sql)?;
 
         let rows = stmt.query_map([seconds.to_string()], |row| {
@@ -1390,25 +1534,20 @@ impl DB {
 
     /// 按小时汇总最近 past_hours 小时的查询明细。
     ///
-    /// 数据来自两张表：
-    /// - **已结束的小时**：直接读 `domain_hourly_detail` 汇总表（每个 (小时, 分组) 一行），
-    ///   不再扫描 24 小时明细，这是本次优化的关键；
-    /// - **实时部分**：窗口最早那个被 `now - past_hours` 截断的小时，以及「当前还没结束的小时」，
-    ///   仍然实时扫明细（各一千到几千行），保证最新一根柱子和边界口径与旧实现一致。
-    ///
-    /// 返回结构（字段名 / 类型 / 数量）与逐条扫明细的旧实现完全相同。
+    /// 已完成的小时读 `domain_hourly_detail` 汇总表；窗口起点所在的「残段小时」（半截、
+    /// 口径与整点汇总不同）、当前小时，以及汇总表缺失的完整小时仍实时扫明细。
+    /// 汇总表不存在时整段退化为实时扫描，不报错；输出与旧的逐条扫描实现完全一致。
     pub fn get_hourly_detail(&self, past_hours: u32) -> Result<HourlyDetail, Box<dyn Error>> {
         let now_ms = smartdns::get_utc_time_ms();
         let local_offset = Local::now().offset().local_minus_utc() as i64;
         let current_hour = local_hour_start_ms(now_ms, local_offset);
-        let mut window_start =
-            now_ms.saturating_sub(HOURLY_DETAIL_HOUR_MS.saturating_mul(past_hours as u64));
 
-        let conn = self.get_readonly_conn();
-        let conn = match conn {
-            Some(conn) => conn,
-            None => return Err("db is not open".into()),
-        };
+        // 与旧实现的 strftime('%s','now') * 1000 对齐：窗口起点按秒截断。
+        let now_sec_ms = now_ms / 1000 * 1000;
+        let mut window_start = now_sec_ms
+            .saturating_sub(HOURLY_DETAIL_HOUR_MS.saturating_mul(past_hours as u64));
+
+        let conn = self.readonly_conn_or_err()?;
 
         // 汇总表可能保留 30 天，但旧实现只能看到明细保留期内的小时。
         // 用明细里最早的一条把窗口夹住，保证输出的小时范围与旧实现完全一致。
@@ -1430,15 +1569,22 @@ impl DB {
         let boundary_hour = local_hour_start_ms(window_start, local_offset);
         let mut hours: HashMap<u64, Vec<HourlyDetailGroupAgg>> = HashMap::new();
 
-        // 1) 已结束的小时：读汇总表（只读十几行到几十行）
-        if boundary_hour < current_hour {
-            let stored_from = boundary_hour + HOURLY_DETAIL_HOUR_MS;
-            let mut stmt = conn.prepare(
-                "SELECT hour_timestamp, domain_group, query_count, cached_count, blocked_count, \
-                        cached_time_sum, cached_time_count, uncached_time_sum, uncached_time_count \
-                 FROM domain_hourly_detail \
-                 WHERE hour_timestamp >= ?1 AND hour_timestamp < ?2",
-            )?;
+        // 汇总表负责的区间：残段小时之后的第一个整点，直到当前小时（不含）。
+        let stored_from = if boundary_hour < current_hour {
+            boundary_hour.saturating_add(HOURLY_DETAIL_HOUR_MS)
+        } else {
+            current_hour
+        };
+
+        // 1) 已结束的完整小时：读汇总表（只读十几行到几十行）
+        if hourly_detail_table_exists(&conn) && stored_from < current_hour {
+            self.debug_query_plan(
+                &conn,
+                HOURLY_DETAIL_STORED_SQL.to_string(),
+                &vec![stored_from.to_string(), current_hour.to_string()],
+            );
+
+            let mut stmt = conn.prepare(HOURLY_DETAIL_STORED_SQL)?;
             let rows = stmt.query_map(
                 rusqlite::params![stored_from as i64, current_hour as i64],
                 |row| {
@@ -1457,44 +1603,56 @@ impl DB {
                 },
             )?;
 
-            for row in rows {
-                let agg = row?;
-                hours.entry(agg.hour_timestamp).or_default().push(agg);
-            }
+            let aggs = rows.collect::<Result<Vec<HourlyDetailGroupAgg>, rusqlite::Error>>()?;
+            push_hourly_detail_aggs(&mut hours, aggs);
         }
 
-        // 2) 实时部分：窗口最早那个被截断的小时 + 当前这个还没结束的小时
-        let mut live_ranges: Vec<(u64, u64)> = Vec::new();
-        if boundary_hour < current_hour {
-            live_ranges.push((window_start, boundary_hour + HOURLY_DETAIL_HOUR_MS));
-            live_ranges.push((current_hour, u64::MAX));
-        } else {
-            live_ranges.push((window_start, u64::MAX));
-        }
-
-        for (start, end) in live_ranges {
+        // 2) 实时部分：残段小时 + 当前这个还没结束的小时
+        for (start, end) in hourly_detail_live_ranges(boundary_hour, current_hour, window_start) {
             if start >= end {
                 continue;
             }
+
+            self.debug_query_plan(
+                &conn,
+                HOURLY_DETAIL_SCAN_SQL.to_string(),
+                &vec![start.to_string(), end.to_string()],
+            );
+
             let (aggs, _) = collect_hourly_detail_aggs(&conn, start, end, local_offset)?;
-            for ((hour_timestamp, _domain_group), agg) in aggs {
-                hours.entry(hour_timestamp).or_default().push(agg);
-            }
+            push_hourly_detail_aggs(&mut hours, aggs.into_values());
         }
 
-        // 3) 兜底：整点汇总的任务可能正在跑（或刚重启、首次运行），
-        //    上一个已完成的小时此时还没落表，就地实时补算这一个小时，
-        //    避免图上短时间少一根柱子。正常情况下汇总表里已有，不会走这里。
-        let last_completed_hour = current_hour.saturating_sub(HOURLY_DETAIL_HOUR_MS);
-        if last_completed_hour >= boundary_hour && !hours.contains_key(&last_completed_hour) {
-            let (aggs, _) = collect_hourly_detail_aggs(
-                &conn,
-                last_completed_hour,
-                current_hour,
-                local_offset,
-            )?;
-            for ((hour_timestamp, _domain_group), agg) in aggs {
-                hours.entry(hour_timestamp).or_default().push(agg);
+        // 3) 兜底：窗口内「明细里有数据、但汇总表里没有」的完整小时，就地实时补算，
+        //    保证任何情况下都不缺柱子。汇总表完整时这里是空集合，不会有额外扫描。
+        if stored_from < current_hour {
+            let present: HashSet<u64> = hours.keys().copied().collect();
+            let missing = missing_hour_ranges(&present, stored_from, current_hour);
+            if !missing.is_empty() {
+                let missing_hours: u64 = missing
+                    .iter()
+                    .map(|(start, end)| (end - start) / HOURLY_DETAIL_HOUR_MS)
+                    .sum();
+                let mut scanned: u64 = 0;
+                for (start, end) in missing {
+                    self.debug_query_plan(
+                        &conn,
+                        HOURLY_DETAIL_SCAN_SQL.to_string(),
+                        &vec![start.to_string(), end.to_string()],
+                    );
+
+                    let (aggs, rows) =
+                        collect_hourly_detail_aggs(&conn, start, end, local_offset)?;
+                    scanned += rows;
+                    push_hourly_detail_aggs(&mut hours, aggs.into_values());
+                }
+
+                dns_log!(
+                    LogLevel::DEBUG,
+                    "hourly detail fallback: {} missing hour(s), {} row(s) scanned live",
+                    missing_hours,
+                    scanned
+                );
             }
         }
 
@@ -1615,11 +1773,7 @@ impl DB {
 
         let local_offset = Local::now().offset().local_minus_utc() as i64;
         let (aggs, scanned) = {
-            let conn = self.get_readonly_conn();
-            let conn = match conn {
-                Some(conn) => conn,
-                None => return Err("db is not open".into()),
-            };
+            let conn = self.readonly_conn_or_err()?;
             collect_hourly_detail_aggs(&conn, start_ms, end_ms, local_offset)?
         };
 
@@ -1634,62 +1788,62 @@ impl DB {
         Ok(scanned)
     }
 
-    /// 汇总表里最早 / 最晚的小时桶（没有任何汇总时返回 (None, None)）。
-    pub fn get_hourly_detail_hour_range(
-        &self,
-    ) -> Result<(Option<u64>, Option<u64>), Box<dyn Error>> {
-        let conn = self.get_readonly_conn();
-        let conn = match conn {
-            Some(conn) => conn,
-            None => return Err("db is not open".into()),
-        };
-
-        let ret = conn.query_row(
-            "SELECT MIN(hour_timestamp), MAX(hour_timestamp) FROM domain_hourly_detail",
-            [],
-            |row| {
-                Ok((
-                    row.get::<_, Option<i64>>(0)?,
-                    row.get::<_, Option<i64>>(1)?,
-                ))
-            },
-        )?;
-
-        Ok((
-            ret.0.map(|v| v.max(0) as u64),
-            ret.1.map(|v| v.max(0) as u64),
-        ))
-    }
-
     /// 整点跑一次的小时汇总入口。
     ///
-    /// 正常情况下只重算最近 `HOURLY_DETAIL_RECHECK_HOURS` 个已完成小时（幂等覆盖）；
-    /// 首次运行、或发现表里历史有缺口时，按明细保留期把已完成小时整体回填一遍。
-    /// 当前这个还没结束的小时**不落库**，由接口实时计算。
+    /// 正常只重算最近 `HOURLY_DETAIL_RECHECK_HOURS` 个已完成小时（幂等覆盖）；首次运行、
+    /// 重启或发现完整小时缺失时，按明细保留期整体回填。
+    /// 只归档完整小时：当前小时和残段小时都是半截的，不由本函数负责（接口实时算）。
     pub fn refresh_hourly_detail(
         &self,
         now_ms: u64,
         retention_ms: u64,
     ) -> Result<u64, Box<dyn Error>> {
+        // 表可能在 open() 时补建失败（例如那一刻被别的进程锁住），这里再补一次。
+        // 还是建不出来就跳过本次汇总：接口会退化为实时扫描，功能不受影响。
+        if !self.ensure_hourly_detail_table() {
+            return Ok(0);
+        }
+
         let local_offset = Local::now().offset().local_minus_utc() as i64;
         let current_hour = local_hour_start_ms(now_ms, local_offset);
-        let backfill_hour = local_hour_start_ms(now_ms.saturating_sub(retention_ms), local_offset);
+        // 最旧的那格被保留期从中间切断，是残段小时、不由汇总表负责，
+        // 所以回填起点取它的下一个整点（窗口内第一个完整小时）。
+        let first_full_hour = local_hour_start_ms(now_ms.saturating_sub(retention_ms), local_offset)
+            .saturating_add(HOURLY_DETAIL_HOUR_MS);
+        if first_full_hour >= current_hour {
+            return Ok(0);
+        }
+
         let recheck_hour =
             current_hour.saturating_sub(HOURLY_DETAIL_RECHECK_HOURS * HOURLY_DETAIL_HOUR_MS);
-
-        let covered = match self.get_hourly_detail_hour_range()? {
-            (Some(min), Some(max)) => {
-                min <= backfill_hour.saturating_add(HOURLY_DETAIL_HOUR_MS)
-                    && max.saturating_add(HOURLY_DETAIL_HOUR_MS) >= recheck_hour
-            }
-            _ => false,
-        };
-        let start_hour = if covered { recheck_hour } else { backfill_hour };
+        let covered = self.hourly_detail_hours_covered(first_full_hour, current_hour)?;
+        let start_hour = if covered { recheck_hour } else { first_full_hour };
         if start_hour >= current_hour {
             return Ok(0);
         }
 
         self.summarize_hourly_detail(start_hour, current_hour)
+    }
+
+    /// 汇总表是否已把 `[first_hour, to_hour)` 内「明细里有数据的完整小时」全部归档。
+    ///
+    /// 比对集合而非 MIN/MAX，才能发现中间空洞；表完整时不会有任何写入。
+    /// 代价是每小时一次 `idx_domain_timestamp` 索引扫描（宽度同明细保留期）。
+    fn hourly_detail_hours_covered(
+        &self,
+        first_hour: u64,
+        to_hour: u64,
+    ) -> Result<bool, Box<dyn Error>> {
+        let local_offset = Local::now().offset().local_minus_utc() as i64;
+        let conn = self.readonly_conn_or_err()?;
+
+        let needed = detail_hours_in_range(&conn, first_hour, to_hour, local_offset)?;
+        if needed.is_empty() {
+            return Ok(true);
+        }
+
+        let stored = stored_hours_in_range(&conn, first_hour, to_hour)?;
+        Ok(needed.iter().all(|hour| stored.contains(hour)))
     }
 
     /// 清理 30 天以前的小时汇总（明细本身只有 24 小时，这里留宽一点方便以后扩展）。
@@ -1762,12 +1916,7 @@ impl DB {
 
     pub fn get_domain_top_list(&self, count: u32) -> Result<Vec<DomainQueryCount>, Box<dyn Error>> {
         let mut ret = Vec::new();
-        let conn = self.get_readonly_conn();
-        if conn.as_ref().is_none() {
-            return Err("db is not open".into());
-        }
-
-        let conn = conn.as_ref().unwrap();
+        let conn = self.readonly_conn_or_err()?;
 
         let mut stmt = conn.prepare("SELECT domain, count, timestamp_start, timestamp_end FROM top_domain_list DESC LIMIT ?")?;
         let rows = stmt.query_map([count.to_string()], |row| {
@@ -1807,12 +1956,7 @@ impl DB {
             step_by_cursor: false,
         };
 
-        let conn = self.get_readonly_conn();
-        if conn.as_ref().is_none() {
-            return Err("db is not open".into());
-        }
-
-        let conn = conn.as_ref().unwrap();
+        let conn = self.readonly_conn_or_err()?;
 
         let (sql_where, sql_order, mut sql_param) = Self::get_domain_sql_where(param)?;
 
@@ -1843,7 +1987,7 @@ impl DB {
             }
         }
 
-        self.debug_query_plan(conn, sql.clone(), &sql_param);
+        self.debug_query_plan(&conn, sql.clone(), &sql_param);
         let stmt = conn.prepare(&sql);
 
         if let Err(e) = stmt {
@@ -2051,11 +2195,7 @@ impl DB {
     /// Fetch all persisted (client_ip, mac) pairs for the hostname cache warmup.
     /// Only pairs with a real MAC are returned so runtime observations are usable.
     pub fn get_client_ip_mac_pairs(&self) -> Result<Vec<(String, String)>, Box<dyn Error>> {
-        let conn = self.get_readonly_conn();
-        if conn.as_ref().is_none() {
-            return Err("db is not open".into());
-        }
-        let conn = conn.as_ref().unwrap();
+        let conn = self.readonly_conn_or_err()?;
 
         let mut stmt = conn.prepare(
             "SELECT client_ip, mac FROM client \
@@ -2077,11 +2217,7 @@ impl DB {
     pub fn get_client_rows_without_hostname(
         &self,
     ) -> Result<Vec<(u32, String, String)>, Box<dyn Error>> {
-        let conn = self.get_readonly_conn();
-        if conn.as_ref().is_none() {
-            return Err("db is not open".into());
-        }
-        let conn = conn.as_ref().unwrap();
+        let conn = self.readonly_conn_or_err()?;
 
         let mut stmt = conn.prepare("SELECT id, client_ip, mac FROM client WHERE hostname = ''")?;
         let rows = stmt.query_map([], |row| {
@@ -2130,12 +2266,7 @@ impl DB {
             step_by_cursor: false,
         };
 
-        let conn = self.get_readonly_conn();
-        if conn.as_ref().is_none() {
-            return Err("db is not open".into());
-        }
-
-        let conn = conn.as_ref().unwrap();
+        let conn = self.readonly_conn_or_err()?;
 
         let (mut sql_where, sql_order, mut sql_param) = Self::get_client_sql_where(param)?;
 
@@ -2297,5 +2428,196 @@ impl DB {
 impl Drop for DB {
     fn drop(&mut self) {
         self.close();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const HOUR: u64 = HOURLY_DETAIL_HOUR_MS;
+
+    #[test]
+    fn local_hour_start_ms_rounds_down_to_local_hour() {
+        // 整点（UTC 偏移 0）
+        assert_eq!(local_hour_start_ms(10 * HOUR, 0), 10 * HOUR);
+        // 非整点（UTC 偏移 0）
+        assert_eq!(local_hour_start_ms(10 * HOUR + 1_234_567, 0), 10 * HOUR);
+        // 非整小时偏移（+5:30）：本地时间比整点早 30 分钟，落在上一个 UTC 小时
+        assert_eq!(
+            local_hour_start_ms(10 * HOUR + 1_234_567, 19_800),
+            9 * HOUR + 1_800_000
+        );
+        // 负偏移（-5:00，与 +5:00 等价地按整点分桶）
+        assert_eq!(local_hour_start_ms(10 * HOUR + 1_234_567, -18_000), 10 * HOUR);
+        // 纪元起点 + 正偏移不能下溢
+        assert_eq!(local_hour_start_ms(0, 28_800), 0);
+        // 一个固定的真实时间戳（跨天场景）
+        assert_eq!(
+            local_hour_start_ms(1_700_000_000_000, 28_800),
+            1_699_999_200_000
+        );
+    }
+
+    #[test]
+    fn local_hour_start_ms_invariants() {
+        // 前提：时间戳是真实的「毫秒级 unix 时间」（远大于任何时区偏移）。
+        // 时间戳小于偏移量的情况（1970 年前后）不在这个函数的使用范围内。
+        for ts in [10 * HOUR, 10 * HOUR + 1_234_567, 1_700_000_000_000] {
+            for off in [0i64, 28_800, 19_800, -18_000, -28_800] {
+                let hour = local_hour_start_ms(ts, off);
+                let off_ms = off * 1000;
+                // 不晚于时间戳，且同一小时内
+                assert!(hour <= ts, "ts={} off={}", ts, off);
+                assert!(ts - hour < HOUR, "ts={} off={}", ts, off);
+                // 加上偏移后一定是整点，说明分桶口径是「本地整点」
+                assert_eq!(
+                    (hour as i64 + off_ms).rem_euclid(HOUR as i64),
+                    0,
+                    "ts={} off={}",
+                    ts,
+                    off
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn live_ranges_tile_window_with_stored_range() {
+        let boundary = 100 * HOUR;
+        let current = 103 * HOUR;
+        let window_start = boundary + 1_000;
+
+        let ranges = hourly_detail_live_ranges(boundary, current, window_start);
+        assert_eq!(
+            ranges,
+            vec![(window_start, boundary + HOUR), (current, u64::MAX)]
+        );
+
+        // 实时区间 + 汇总表区间（[boundary+HOUR, current)）必须无缝、无重叠地覆盖窗口
+        let mut all = ranges;
+        all.push((boundary + HOUR, current));
+        all.sort();
+
+        assert_eq!(all[0].0, window_start);
+        for pair in all.windows(2) {
+            assert_eq!(pair[0].1, pair[1].0, "gap or overlap in {:?}", all);
+        }
+        assert_eq!(all.last().unwrap().1, u64::MAX);
+    }
+
+    #[test]
+    fn live_ranges_collapse_when_window_inside_current_hour() {
+        let current = 100 * HOUR;
+        let window_start = current + 60_000;
+
+        assert_eq!(
+            hourly_detail_live_ranges(current, current, window_start),
+            vec![(window_start, u64::MAX)]
+        );
+    }
+
+    #[test]
+    fn missing_hour_ranges_coalesces_gaps() {
+        let first = 100 * HOUR;
+        let to = 106 * HOUR;
+        let present: HashSet<u64> = [first, first + 2 * HOUR, first + 5 * HOUR]
+            .into_iter()
+            .collect();
+
+        assert_eq!(
+            missing_hour_ranges(&present, first, to),
+            vec![
+                (first + HOUR, first + 2 * HOUR),
+                (first + 3 * HOUR, first + 5 * HOUR),
+            ]
+        );
+
+        // 表完整时没有任何补算区间
+        let all: HashSet<u64> = (0..6).map(|i| first + i * HOUR).collect();
+        assert!(missing_hour_ranges(&all, first, to).is_empty());
+    }
+
+    #[test]
+    fn live_and_missing_ranges_tile_window_without_stored_holes() {
+        // 场景：4 个完整小时里只有第 1、3 个在汇总表中
+        let boundary = 100 * HOUR;
+        let current = 104 * HOUR;
+        let window_start = boundary + 42_000;
+        let stored_from = boundary + HOUR;
+        let present: HashSet<u64> = [stored_from, stored_from + 2 * HOUR].into_iter().collect();
+
+        let mut all: Vec<(u64, u64)> = missing_hour_ranges(&present, stored_from, current);
+        all.extend(hourly_detail_live_ranges(boundary, current, window_start));
+        all.extend(present.iter().map(|hour| (*hour, *hour + HOUR)));
+        all.sort();
+
+        assert_eq!(all[0].0, window_start);
+        for pair in all.windows(2) {
+            assert_eq!(pair[0].1, pair[1].0, "gap or overlap in {:?}", all);
+        }
+        assert_eq!(all.last().unwrap().1, u64::MAX);
+        // 残段小时只被算一次
+        assert_eq!(all.iter().filter(|(s, _)| *s == window_start).count(), 1);
+    }
+
+    #[test]
+    fn upsert_hourly_detail_is_idempotent() {
+        let db = DB {
+            conn: Mutex::new(Some(Connection::open_in_memory().unwrap())),
+            version: 10000,
+            query_plan: false,
+        };
+        {
+            let guard = db.conn.lock().unwrap();
+            db.create_hourly_detail_table(guard.as_ref().unwrap())
+                .unwrap();
+        }
+
+        let aggs = vec![HourlyDetailGroupAgg {
+            hour_timestamp: 100 * HOUR,
+            domain_group: "default".to_string(),
+            query_count: 10,
+            cached_count: 4,
+            blocked_count: 1,
+            cached_time_sum: 12.0,
+            cached_time_count: 4,
+            uncached_time_sum: 30.0,
+            uncached_time_count: 6,
+        }];
+
+        // 同一个小时重复汇总（重启 / 重跑整点任务）必须覆盖，不能累加
+        db.upsert_domain_hourly_detail(&aggs).unwrap();
+        db.upsert_domain_hourly_detail(&aggs).unwrap();
+
+        let guard = db.conn.lock().unwrap();
+        let conn = guard.as_ref().unwrap();
+
+        let rows: i64 = conn
+            .query_row("SELECT COUNT(*) FROM domain_hourly_detail", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(rows, 1, "same (hour, group) must be overwritten, not appended");
+
+        let (query_count, cached_count, cached_sum, cached_cnt, blocked): (i64, i64, f64, i64, i64) =
+            conn.query_row(
+                "SELECT query_count, cached_count, cached_time_sum, cached_time_count, blocked_count \
+                 FROM domain_hourly_detail WHERE hour_timestamp = ?1 AND domain_group = ?2",
+                rusqlite::params![(100 * HOUR) as i64, "default"],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                    ))
+                },
+            )
+            .unwrap();
+
+        assert_eq!((query_count, cached_count, cached_cnt, blocked), (10, 4, 4, 1));
+        assert_eq!(cached_sum, 12.0);
     }
 }

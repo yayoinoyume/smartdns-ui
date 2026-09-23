@@ -1145,7 +1145,9 @@ impl API {
     ) -> Result<Response<Full<Bytes>>, HttpError> {
         let data_server = this.get_data_server();
         let ret = API::call_blocking(this, move || -> Result<(), String> {
-            data_server.get_stat().refresh();
+            // 复用整点任务的「正在跑」护栏：如果刷新已经在跑，这里直接返回成功，
+            // 不再并发做一次全量回填（结果本来就幂等，但没必要白扫一遍）。
+            data_server.get_stat().refresh_with_guard();
             Ok(())
         })
         .await;
