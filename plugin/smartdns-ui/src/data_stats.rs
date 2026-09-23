@@ -455,12 +455,31 @@ impl DataStats {
         if let Err(e) = ret {
             dns_log!(LogLevel::WARN, "refresh domain top list error: {}", e);
         }
+        // TODO: 下面两条清理的阈值疑似写错：这里传的是「30 / 90 天的**毫秒数**」，
+        // 而这两个函数是拿它跟「时间戳（毫秒）」比较的，等于传了个 1970 年前后的时间点，
+        // 结果一行都删不掉。正确写法应该是 now - 30 * 24 * 3600 * 1000。
+        // 本次**故意保持原行为**：一旦修好，domain_hourly_count / domain_daily_count
+        // 就会开始真正删除数据，需要用户单独批准后再改。
         let _ = self
             .db
             .delete_hourly_query_count_before_timestamp(30 * 24 * 3600 * 1000);
         let _ = self
             .db
             .delete_daily_query_count_before_timestamp(90 * 24 * 3600 * 1000);
+    }
+
+    /// 手动刷新（`PUT /api/stats/refresh`）入口：与整点 worker 共用同一把
+    /// `is_hourly_work_running` 护栏，避免两边同时做一次全量回填（结果幂等但白扫一遍）。
+    ///
+    /// 返回是否真的执行了刷新；已经有刷新在跑时直接返回 false（不等待、不死锁）。
+    pub fn refresh_with_guard(self: &Arc<Self>) -> bool {
+        if self.is_hourly_work_running.fetch_or(true, Ordering::Acquire) {
+            return false;
+        }
+
+        self.refresh();
+        self.is_hourly_work_running.store(false, Ordering::Release);
+        true
     }
 
     async fn update_stats(self: &Arc<Self>) {
