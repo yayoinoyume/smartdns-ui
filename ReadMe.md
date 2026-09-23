@@ -1,4 +1,29 @@
+# SmartDNS WebUI 增强版
+
+> 本 fork 基于上游 [PikuZheng/smartdns](https://github.com/PikuZheng/smartdns) 构建，增加了以下功能：
+
+## 本 fork 的改进
+
+- **客户端主机名显示**：查询日志、仪表盘、客户端列表中显示设备主机名（从 DHCP lease 获取）
+- **小时明细预聚合**：将 24 小时内的域名明细按小时预聚合到 `domain_hourly_detail` 表，仪表盘查询更快
+- **小时明细 API**：新增按小时的命中率、拦截数、平均延迟、分组统计接口
+- **CI/CD**：GitHub Actions 自动构建 `smartdns_ui.so` 并发布 Release
+
+## 安装
+
+1. 从 [Releases](https://github.com/yayoinoyume/smartdns-ui/releases) 下载 `smartdns_ui.so` 和 `sha256.txt`
+2. 校验：`sha256sum -c sha256.txt`
+3. 将 `.so` 上传到路由器：`scp smartdns_ui.so root@路由器IP:/usr/lib/smartdns/plugins/`
+4. 在 smartdns.conf 中加载插件：
+   ```
+   plugin /usr/lib/smartdns/plugins/smartdns_ui.so
+   ```
+5. 前端静态文件放到 `/usr/share/smartdns/nroot/`（配合 [smartdns-webui](https://github.com/yayoinoyume/smartdns-webui) 构建）
+
+---
+
 # SmartDNS
+
 
 [![fetch upstream](https://github.com/PikuZheng/smartdns/actions/workflows/fetch%20upstream.yml/badge.svg)](https://github.com/PikuZheng/smartdns/actions/workflows/fetch%20upstream.yml)
 [![Test Build](https://github.com/PikuZheng/smartdns/actions/workflows/test-new.yml/badge.svg)](https://github.com/PikuZheng/smartdns/actions/workflows/test-new.yml)
