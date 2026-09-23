@@ -430,6 +430,22 @@ impl DataStats {
             }
         }
 
+        // 把「刚结束的那个小时」汇总进 domain_hourly_detail（首次运行整体回填，
+        // 之后每次只重算最近几个小时），这样 /api/stats/hourly-detail 不用再扫 24 小时明细。
+        let retention_ms = self.conf.read().unwrap().max_log_age_ms;
+        match self.db.refresh_hourly_detail(get_utc_time_ms(), retention_ms) {
+            Ok(scanned) if scanned > 0 => dns_log!(
+                LogLevel::DEBUG,
+                "hourly detail summarize: {} rows scanned",
+                scanned
+            ),
+            Ok(_) => {}
+            Err(e) => dns_log!(LogLevel::WARN, "hourly detail summarize error: {}", e),
+        }
+        let _ = self
+            .db
+            .delete_hourly_detail_before_timestamp(now - 30 * 24 * 3600 * 1000);
+
         let ret = self.db.refresh_client_top_list(now - 7 * 24 * 3600 * 1000);
         if let Err(e) = ret {
             dns_log!(LogLevel::WARN, "refresh client top list error: {}", e);
