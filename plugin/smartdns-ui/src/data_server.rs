@@ -544,6 +544,13 @@ impl DataServer {
         self.db.get_daily_query_count(past_days.unwrap_or(30))
     }
 
+    pub fn get_hourly_detail(
+        &self,
+        past_hours: Option<u32>,
+    ) -> Result<HourlyDetail, Box<dyn Error>> {
+        self.db.get_hourly_detail(past_hours.unwrap_or(24))
+    }
+
     pub fn get_stat(&self) -> Arc<DataStats> {
         self.stat.clone()
     }

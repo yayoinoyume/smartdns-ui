@@ -883,6 +883,39 @@ pub fn api_msg_parse_hourly_query_count(data: &str) -> Result<HourlyQueryCount, 
     })
 }
 
+pub fn api_msg_gen_hourly_detail(detail: &HourlyDetail) -> String {
+    let json_str = json!({
+        "query_timestamp": detail.query_timestamp,
+        "hours":
+        detail.hourly_detail
+                .iter()
+                .map(|x| {
+                    let s = json!({
+                        "hour": x.hour,
+                        "query_count": x.query_count,
+                        "cached_count": x.cached_count,
+                        "blocked_count": x.blocked_count,
+                        "avg_query_time_cached": x.avg_query_time_cached,
+                        "avg_query_time_uncached": x.avg_query_time_uncached,
+                        "groups":
+                        x.groups
+                                .iter()
+                                .map(|g| {
+                                    json!({
+                                        "domain_group": g.domain_group,
+                                        "query_count": g.query_count,
+                                        "cached_count": g.cached_count,
+                                    })
+                                })
+                                .collect::<Vec<serde_json::Value>>(),
+                    });
+                    s
+                })
+                .collect::<Vec<serde_json::Value>>()
+    });
+    json_str.to_string()
+}
+
 pub fn api_msg_gen_request_qps(qps: u32) -> String {
     let json_str = json!({
         "qps": qps,

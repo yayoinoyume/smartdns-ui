@@ -104,6 +104,7 @@ impl API {
         api.register(Method::GET, "/api/stats/overview", true, APIRoute!(API::api_stats_get_overview));
         api.register(Method::GET, "/api/stats/hourly-query-count", true, APIRoute!(API::api_stats_get_hourly_query_count));
         api.register(Method::GET, "/api/stats/daily-query-count", true, APIRoute!(API::api_stats_get_daily_query_count));
+        api.register(Method::GET, "/api/stats/hourly-detail", true, APIRoute!(API::api_stats_get_hourly_detail));
         api.register(Method::PUT, "/api/stats/refresh", true, APIRoute!(API::api_stats_refresh));
         api.register(Method::GET, "/api/whois", true, APIRoute!(API::api_whois));
         api.register(Method::GET, "/api/tool/term", true, APIRoute!(API::api_tool_term));
@@ -1185,6 +1186,39 @@ impl API {
         }
 
         let body = api_msg_gen_daily_query_count(&ret.unwrap());
+        API::response_build(StatusCode::OK, body)
+    }
+
+    async fn api_stats_get_hourly_detail(
+        this: Arc<HttpServer>,
+        _param: APIRouteParam,
+        _req: Request<body::Incoming>,
+    ) -> Result<Response<Full<Bytes>>, HttpError> {
+        let params = API::get_params(&_req);
+        let past_hours = API::params_get_value(&params, "past_hours");
+        let data_server = this.get_data_server();
+        let ret = API::call_blocking(this, move || {
+            let ret = data_server.get_hourly_detail(past_hours);
+            if let Err(e) = ret {
+                return Err(e.to_string());
+            }
+
+            let ret = ret.unwrap();
+
+            return Ok(ret);
+        })
+        .await;
+
+        if let Err(e) = ret {
+            return API::response_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string().as_str());
+        }
+
+        let ret = ret.unwrap();
+        if let Err(e) = ret {
+            return API::response_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string().as_str());
+        }
+
+        let body = api_msg_gen_hourly_detail(&ret.unwrap());
         API::response_build(StatusCode::OK, body)
     }
 
