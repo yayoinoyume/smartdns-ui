@@ -1,11 +1,11 @@
 name: Build smartdns_ui.so
 
-# 上游更新会由 sync-upstream.yml 合进 feat/client-hostname；
+# 上游更新会由 sync-upstream.yml 合进 main；
 # 只要插件目录 / C 头文件 / CI 配置有变化，这里就会自动编译、验证、发版。
 
 on:
   push:
-    branches: [feat/client-hostname]
+    branches: [main]
     paths:
       - 'plugin/smartdns-ui/**'
       - 'src/include/**'
@@ -176,7 +176,7 @@ jobs:
   release:
     name: 发版
     needs: [unit-tests, build, smoke]
-    if: github.ref == 'refs/heads/feat/client-hostname'
+    if: github.ref == 'refs/heads/main'
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4

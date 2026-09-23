@@ -1,7 +1,7 @@
 name: Sync upstream (PikuZheng)
 
 # 把上游 PikuZheng/smartdns 的新提交合进我们的两个分支。
-# 用 merge 而不是强推 —— 因为 master 上放着我们自己的 workflow 文件，
+# 用 merge 而不是强推 —— 因为 archive-master 上放着我们自己的 workflow 文件，
 # 强推会把它抹掉（上游自带的 fetch upstream.yml 就是强推，所以那个要禁用）。
 #
 # 冲突时直接失败退出，让 GitHub 发邮件通知人去处理，不做任何猜测性操作。
@@ -26,7 +26,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: master
+          ref: archive-master
           fetch-depth: 0
           token: ${{ secrets.SYNC_TOKEN }}
 
@@ -51,7 +51,7 @@ jobs:
           fi
           echo "SYNC_TOKEN 属于账号: $(gh api user --jq .login 2>/dev/null || echo '(读不到)')"
 
-          if git push --dry-run origin HEAD:refs/heads/master > /tmp/dryrun.log 2>&1; then
+          if git push --dry-run origin HEAD:refs/heads/archive-master > /tmp/dryrun.log 2>&1; then
             echo "SYNC_TOKEN 写权限正常"
           else
             echo "::error::SYNC_TOKEN 没有写权限。git 的原话："
@@ -80,34 +80,34 @@ jobs:
           echo "上游 master 最新提交:"
           git log --oneline -3 upstream/master
 
-      - name: 合并上游到 master
+      - name: 合并上游到 archive-master
         run: |
           if git merge --no-edit upstream/master; then
-            echo "master 合并干净"
+            echo "archive-master 合并干净"
           else
             git merge --abort
-            echo "::error::上游合并到 master 有冲突，需要人工处理（本地 fetch 后手工 merge）。"
+            echo "::error::上游合并到 archive-master 有冲突，需要人工处理（本地 fetch 后手工 merge）。"
             exit 1
           fi
 
-      - name: 推送 master
+      - name: 推送 archive-master
         run: |
-          echo "推送前 master = $(git rev-parse HEAD)"
-          git push origin master
-          echo "master 已推送"
+          echo "推送前 archive-master = $(git rev-parse HEAD)"
+          git push origin archive-master
+          echo "archive-master 已推送"
 
-      - name: 把 master 合进 feat/client-hostname
+      - name: 把 archive-master 合进 main
         run: |
-          git fetch origin feat/client-hostname
-          git checkout feat/client-hostname
-          if git merge --no-edit origin/master; then
-            echo "特性分支合并干净"
+          git fetch origin main
+          git checkout main
+          if git merge --no-edit origin/archive-master; then
+            echo "main 合并干净"
           else
             git merge --abort
-            echo "::error::master 合并到 feat/client-hostname 有冲突，需要人工处理。"
+            echo "::error::archive-master 合并到 main 有冲突，需要人工处理。"
             echo "::error::提示：冲突很可能在 plugin/smartdns-ui/src/ 下，也就是我们改动的那 6 个文件。"
             exit 1
           fi
-          echo "推送前 feat/client-hostname = $(git rev-parse HEAD)"
-          git push origin feat/client-hostname
-          echo "feat/client-hostname 已推送 —— 这一步会触发 build-ui.yml 编译发版"
+          echo "推送前 main = $(git rev-parse HEAD)"
+          git push origin main
+          echo "main 已推送 —— 这一步会触发 build-ui.yml 编译发版"
