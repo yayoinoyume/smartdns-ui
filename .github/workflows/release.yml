@@ -3,11 +3,12 @@ name: Build and Release Artifacts
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
 
+# 与上游版本的区别：去掉了每日 18:00 UTC 的定时任务。
+# 原因：本 fork 只在「发版时」需要完整包，每天自动跑一次完整打包（6 架构 + 6 份
+# OpenSSL，约 40~90 分钟）纯属浪费；需要时用 workflow_dispatch 手动触发即可。
 on:
   release:
-    types: [published]
-  schedule:
-    - cron: '0 18 * * *' # Daily at 18:00 UTC (02:00 AM Beijing Time)
+    types: [published]   # build-ui.yml 发 release 后自动醒来打包并上传到同一个 release
   workflow_dispatch: # Allows manual trigger from GitHub UI for testing
 
 permissions:

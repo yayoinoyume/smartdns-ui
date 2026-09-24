@@ -199,8 +199,11 @@ jobs:
           sha256sum smartdns_ui.so | tee sha256.txt
 
       - name: 发布 Release
+        # 必须用 PAT（SYNC_TOKEN）而不是 GITHUB_TOKEN：
+        # GITHUB_TOKEN 创建 release 产生的事件不会触发其它 workflow，
+        # 那样 release.yml（完整包打包）永远不会被唤醒。
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ secrets.SYNC_TOKEN }}
         run: |
           gh release create '${{ steps.ver.outputs.tag }}' \
             dist/smartdns_ui.so dist/sha256.txt \
