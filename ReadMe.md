@@ -93,7 +93,10 @@ SmartDNS官网：[https://pymumu.github.io/smartdns](https://pymumu.github.io/sm
 
 ### 仪表盘
 
-![SmartDNS-WebUI](doc/smartdns-webui.png)
+<img width="1276" height="668" alt="image" src="https://github.com/user-attachments/assets/11bf97bf-584a-4706-8e91-b4c749bb6c71" />
+
+<img width="1278" height="671" alt="image" src="https://github.com/user-attachments/assets/1fb81e9b-f73f-4d5c-b19d-0a5fa550657f" />
+
 
 ### 速度对比
 
