@@ -1,0 +1,74 @@
+name: Verify Release Packages (multi-arch)
+
+# 用 QEMU 在「目标架构的容器」里，把 release 包当成真实安装包验证一遍：
+# 解压 → 安装 → 启动 → 断言（插件加载 / 租约生效 / DNS / WebUI）。
+# 发布后自动跑；也可手动指定任意历史 tag 重跑。
+#
+# 覆盖架构：x86_64 / aarch64 / armv7 / i686
+# 未覆盖：mips、mipsel —— Alpine 与 Debian 均已放弃这些架构的镜像，
+#         无可用基础镜像，只能在打包阶段做静态检查。
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: '要验证的 release tag（留空则用触发本次运行的 release）'
+        required: false
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    name: 验证 ${{ matrix.name }}
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { name: x86_64-linux, platform: 'linux/amd64' }
+          - { name: aarch64-linux, platform: 'linux/arm64' }
+          - { name: arm-linux,   platform: 'linux/arm/v7' }
+          - { name: x86-linux,   platform: 'linux/386' }
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 注册 QEMU（多架构模拟）
+        uses: docker/setup-qemu-action@v3
+
+      - name: 下载该架构的发布包
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          TAG="${{ github.event.inputs.tag }}"
+          if [ -z "$TAG" ]; then TAG="${{ github.event.release.tag_name }}"; fi
+          if [ -z "$TAG" ]; then
+            echo "::error::没有指定 tag，且不是 release 触发"
+            exit 1
+          fi
+          echo "验证 release: $TAG"
+          mkdir -p /tmp/pkgs
+          gh release download "$TAG" --repo "$GITHUB_REPOSITORY" \
+            --pattern "*${{ matrix.name }}-all.tar.gz" --dir /tmp/pkgs
+          ls -la /tmp/pkgs
+
+      - name: 容器内真实安装并运行
+        run: |
+          PKG=$(ls /tmp/pkgs/*.tar.gz | head -1)
+          echo "待验证包: $(basename "$PKG")"
+          docker run --rm \
+            --platform ${{ matrix.platform }} \
+            -v /tmp/pkgs:/pkg:ro \
+            -v "$GITHUB_WORKSPACE/ci:/ci:ro" \
+            alpine:latest sh /ci/verify-package.sh "/pkg/$(basename "$PKG")"
+
+      - name: 汇总
+        if: always()
+        run: |
+          if [ "${{ job.status }}" = "success" ]; then
+            echo "### ✅ ${{ matrix.name }} 包验证通过" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "### ❌ ${{ matrix.name }} 包验证失败" >> $GITHUB_STEP_SUMMARY
+          fi
