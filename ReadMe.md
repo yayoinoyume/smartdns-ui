@@ -20,6 +20,32 @@
    ```
 5. 前端静态文件放到 `/usr/share/smartdns/nroot/`（配合 [smartdns-webui](https://github.com/yayoinoyume/smartdns-webui) 构建）
 
+### 客户端主机名显示（可选）
+
+用 DHCP lease 里的主机名替换界面上光秃秃的 IP。**默认关闭**，必须在 smartdns.conf 里显式指定文件路径才会生效：
+
+```
+plugin /usr/lib/smartdns/plugins/smartdns_ui.so
+smartdns-ui.lease-file /tmp/dhcp.leases
+```
+
+- `smartdns-ui.lease-file <路径>`：本机的 dnsmasq 格式 lease 文件，主机名的主要来源。
+- `smartdns-ui.hostname-map <路径>`：可选的手动映射表，每行 `<IP或MAC> <名称>`，优先级最高，用来给固定设备补名字。
+
+lease 文件必须是 dnsmasq 格式，每行五个字段：
+
+```
+<过期时间戳> <MAC> <IP> <主机名> <clientid>
+1900000000 aa:bb:cc:dd:ee:ff 192.168.2.100 my-laptop 01:aa:bb:cc:dd:ee:ff
+```
+
+注释行、字段不足或主机名为 `*` 的行会被跳过。**不支持 odhcpd 格式。**
+
+主机名来源优先级：手动映射表 > 运行时观测（靠 MAC 桥接，让 IPv6 客户端也能显示名字）> lease 文件。两者都不配置时会静默关闭，界面回退显示 IP。
+
+> **插件只读取本机上的文件，不会自己跨设备同步或远程拉取。**
+> 如果你的机器不是 DHCP 服务器（例如旁路由，本机 lease 文件始终为空），需要自行把主路由的 lease 文件同步到本机某个路径，再让 `smartdns-ui.lease-file` 指向它。
+
 ---
 
 # SmartDNS
