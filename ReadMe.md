@@ -1,4 +1,69 @@
+# SmartDNS WebUI 增强版
+
+> 本 fork 基于上游 [PikuZheng/smartdns](https://github.com/PikuZheng/smartdns) 构建，增加了以下功能：
+
+## 本 fork 的改进
+
+- **客户端主机名显示**：查询日志、仪表盘、客户端列表中显示设备主机名（从 DHCP lease 获取）
+- **小时明细预聚合**：将 24 小时内的域名明细按小时预聚合到 `domain_hourly_detail` 表，仪表盘查询更快
+- **小时明细 API**：新增按小时的命中率、拦截数、平均延迟、分组统计接口
+- **CI/CD**：GitHub Actions 自动构建 `smartdns_ui.so` 并发布 Release
+
+## 安装
+
+1. 从 [Releases](https://github.com/yayoinoyume/smartdns-ui/releases) 下载 `smartdns_ui.so` 和 `sha256.txt`
+2. 校验：`sha256sum -c sha256.txt`
+3. 将 `.so` 上传到路由器：`scp smartdns_ui.so root@路由器IP:/usr/lib/smartdns/plugins/`
+4. 在 smartdns.conf 中加载插件：
+   ```
+   plugin /usr/lib/smartdns/plugins/smartdns_ui.so
+   ```
+5. 前端静态文件放到 `/usr/share/smartdns/nroot/`（配合 [smartdns-webui](https://github.com/yayoinoyume/smartdns-webui) 构建）
+
+### 客户端主机名显示（可选）
+
+用 DHCP lease 里的主机名替换界面上光秃秃的 IP。**默认关闭**，必须在 smartdns.conf 里显式指定文件路径才会生效：
+
+```
+plugin /usr/lib/smartdns/plugins/smartdns_ui.so
+smartdns-ui.lease-file /tmp/dhcp.leases
+```
+
+- `smartdns-ui.lease-file <路径>`：本机的 dnsmasq 格式 lease 文件，主机名的主要来源。
+- `smartdns-ui.hostname-map <路径>`：可选的手动映射表，每行 `<IP或MAC> <名称>`，优先级最高，用来给固定设备补名字。
+
+lease 文件必须是 dnsmasq 格式，每行五个字段：
+
+```
+<过期时间戳> <MAC> <IP> <主机名> <clientid>
+1900000000 aa:bb:cc:dd:ee:ff 192.168.1.100 my-laptop 01:aa:bb:cc:dd:ee:ff
+```
+
+注释行、字段不足或主机名为 `*` 的行会被跳过。**不支持 odhcpd 格式。**
+
+主机名来源优先级：手动映射表 > 运行时观测（靠 MAC 桥接，让 IPv6 客户端也能显示名字）> lease 文件。两者都不配置时会静默关闭，界面回退显示 IP。
+
+### 启用 WebUI（安装后必读）
+
+**本增强版的 WebUI 不会自动启用。** 安装/升级后需要按 SmartDNS 官方文档自行修改配置来加载插件，否则 WebUI 打不开：
+
+```
+# /etc/smartdns/smartdns.conf
+plugin /usr/local/lib/smartdns/smartdns_ui.so
+smartdns-ui.www-root /usr/share/smartdns/wwwroot
+```
+
+具体配置项、路径与参数请以 SmartDNS 官方文档为准：<https://pymumu.github.io/smartdns/>
+
+> 为什么默认不开启：多数用户只需要 DNS 本身，不希望额外加载 WebUI 插件占用内存。所以本 fork 保持上游默认行为，不做自动启用。
+
+> **插件只读取本机上的文件，不会自己跨设备同步或远程拉取。**
+> 如果你的机器不是 DHCP 服务器（例如旁路由，本机 lease 文件始终为空），需要自行把主路由的 lease 文件同步到本机某个路径，再让 `smartdns-ui.lease-file` 指向它。
+
+---
+
 # SmartDNS
+
 
 [![fetch upstream](https://github.com/PikuZheng/smartdns/actions/workflows/fetch%20upstream.yml/badge.svg)](https://github.com/PikuZheng/smartdns/actions/workflows/fetch%20upstream.yml)
 [![Test Build](https://github.com/PikuZheng/smartdns/actions/workflows/test-new.yml/badge.svg)](https://github.com/PikuZheng/smartdns/actions/workflows/test-new.yml)
@@ -152,7 +217,7 @@ rtt min/avg/max/mdev = 5.954/6.133/6.313/0.195 ms
 
 ## 捐赠
 
-如果你觉得此项目对你有帮助，请捐助我们，使项目能持续发展和更加完善。
+如果你觉得此项目对你有帮助，请捐助项目原作者，使项目能持续发展和更加完善。
 
 ### PayPal 贝宝
 
