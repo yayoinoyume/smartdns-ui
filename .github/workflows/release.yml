@@ -10,8 +10,6 @@ on:
   release:
     types: [published]   # build-ui.yml 发 release 后自动醒来打包并上传到同一个 release
   workflow_dispatch: # Allows manual trigger from GitHub UI for testing
-  push:                # 临时：改本文件即自测一次，验证打包链路用，验证通过后删除
-    paths: ['.github/workflows/release.yml']
 
 permissions:
   contents: write

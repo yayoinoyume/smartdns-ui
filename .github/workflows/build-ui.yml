@@ -1,5 +1,9 @@
 name: Build smartdns_ui.so
 
+# 本 workflow 负责「插件 .so」的构建、验证与发版。
+# 发布 release 后会触发 .github/workflows/release.yml，
+# 由它打包全架构完整包（内含本插件 + WebUI 前端）并上传到同一个 release。
+#
 # 上游更新会由 sync-upstream.yml 合进 main；
 # 只要插件目录 / C 头文件 / CI 配置有变化，这里就会自动编译、验证、发版。
 
