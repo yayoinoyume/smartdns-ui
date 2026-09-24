@@ -10,6 +10,8 @@ on:
   release:
     types: [published]   # build-ui.yml 发 release 后自动醒来打包并上传到同一个 release
   workflow_dispatch: # Allows manual trigger from GitHub UI for testing
+  push:                # 临时：改本文件即自测一次，验证打包链路用，验证通过后删除
+    paths: ['.github/workflows/release.yml']
 
 permissions:
   contents: write
@@ -360,7 +362,8 @@ jobs:
           EOF
 
           chmod +x build-static.sh
-          ./build-static.sh
+          set -o pipefail
+          ./build-static.sh 2>&1 | tee /tmp/build-static.log
 
           echo "=== List of all files generated in workspace ==="
           ls -la
@@ -383,6 +386,21 @@ jobs:
           echo "=== List of all files in release-assets ==="
           ls -la release-assets/
           echo "==========================================="
+
+      # 诊断：打包失败时把日志尾部贴到 commit 评论（公开可读，方便定位 CI 失败原因）
+      - name: Dump build log on failure
+        if: failure()
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          echo "=== 日志尾部 120 行 ==="
+          tail -n 120 /tmp/build-static.log 2>/dev/null || true
+          if [ -f /tmp/build-static.log ]; then
+            tail -c 60000 /tmp/build-static.log > /tmp/build-static.tail
+            gh api "repos/${{ github.repository }}/commits/${{ github.sha }}/comments" \
+              -f body="$(cat /tmp/build-static.tail)" \
+              && echo "已把日志贴到 commit 评论" || echo "贴评论失败"
+          fi
 
       # 10. Upload all packages and binaries individually to the GitHub Release (only on release event)
       - name: Upload Release Assets
