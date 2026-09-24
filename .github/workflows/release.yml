@@ -3,61 +3,33 @@ name: Build and Release Artifacts
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
 
+# 与上游版本的区别：去掉了每日 18:00 UTC 的定时任务。
+# 原因：本 fork 只在「发版时」需要完整包，每天自动跑一次完整打包（6 架构 + 6 份
+# OpenSSL，约 40~90 分钟）纯属浪费；需要时用 workflow_dispatch 手动触发即可。
 on:
-  release:
-    types: [published]
-  schedule:
-    - cron: '0 18 * * *' # Daily at 18:00 UTC (02:00 AM Beijing Time)
-  workflow_dispatch: # Allows manual trigger from GitHub UI for testing
+  workflow_run:
+    workflows: ["Build smartdns_ui.so"]
+    types: [completed]   # build-ui 跑完（且成功）后自动跟进
+  workflow_dispatch:     # 手动触发（补跑/复现用）
 
 permissions:
-  contents: write
+  contents: write   # 发布 release
+  actions: read     # 取回上游 workflow 的产物
 
 jobs:
-  check_updates:
-    name: Check for updates (Schedule only)
-    runs-on: ubuntu-latest
-    outputs:
-      should_run: ${{ steps.decision.outputs.should_run }}
-    steps:
-      - name: Checkout Code
-        uses: actions/checkout@v6
-
-      - name: Make decision
-        id: decision
-        run: |
-          if [ "${{ github.event_name }}" = "schedule" ]; then
-            # Fetch the nightly tag from origin
-            git fetch origin refs/tags/nightly:refs/tags/nightly || true
-            if git rev-parse refs/tags/nightly >/dev/null 2>&1; then
-              NIGHTLY_SHA=$(git rev-parse refs/tags/nightly)
-              CURRENT_SHA=$(git rev-parse HEAD)
-              if [ "$NIGHTLY_SHA" = "$CURRENT_SHA" ]; then
-                echo "Current commit ($CURRENT_SHA) is the same as the existing nightly tag. Skipping scheduled build."
-                echo "should_run=false" >> $GITHUB_OUTPUT
-              else
-                echo "New commits detected since the last nightly tag. Running scheduled build."
-                echo "should_run=true" >> $GITHUB_OUTPUT
-              fi
-            else
-              echo "No existing nightly tag found. Running build."
-              echo "should_run=true" >> $GITHUB_OUTPUT
-            fi
-          else
-            echo "Not a scheduled run (event: ${{ github.event_name }}). Running build."
-            echo "should_run=true" >> $GITHUB_OUTPUT
-          fi
-
   build-release:
-    name: Build Cross-Compiled Artifacts
-    needs: check_updates
-    if: needs.check_updates.outputs.should_run == 'true'
+    name: 打包全架构完整包
+    # 只有 build-ui 那三个闸（单元测试/产物检查/容器冒烟）全部通过才继续
+    if: github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success'
     runs-on: ubuntu-22.04
 
     steps:
       # 1. Checkout the repository
       - name: Checkout Code
         uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+          ref: ${{ github.event.workflow_run.head_sha || github.sha }}
 
       # 2. Setup Node.js (needed for webui compilation)
       - name: Setup Node.js
@@ -237,7 +209,9 @@ jobs:
       - name: Build All Targets
         run: |
           # 1. Determine release version
-          export RELEASE_VERSION="$(date +"1.%Y.%m.%d-%H%M")"
+          # 版本号必须让各打包脚本转成合法 apk 版本（形如 1.2026.0924-r1800）：
+          # 末段必须是纯数字，不能带 -HHMM，否则 apk 版本号出现两个横杠而报错。
+          export RELEASE_VERSION="$(date +"1.%Y.%m%d.%H%M")"
           
           echo "Building Version: ${RELEASE_VERSION}"
           
@@ -248,7 +222,7 @@ jobs:
 
           ORIG_PATH="$PATH"
           CURR_DIR=$(cd $(dirname $0);pwd)
-          VER="${RELEASE_VERSION:-$(date +"1.%Y.%m.%d-%H%M")}"
+          VER="${RELEASE_VERSION:-$(date +"1.%Y.%m%d.%H%M")}"
           CODE_DIR=$(pwd)
 
           build()
@@ -359,7 +333,8 @@ jobs:
           EOF
 
           chmod +x build-static.sh
-          ./build-static.sh
+          set -o pipefail
+          ./build-static.sh 2>&1 | tee /tmp/build-static.log
 
           echo "=== List of all files generated in workspace ==="
           ls -la
@@ -383,40 +358,120 @@ jobs:
           ls -la release-assets/
           echo "==========================================="
 
-      # 10. Upload all packages and binaries individually to the GitHub Release (only on release event)
-      - name: Upload Release Assets
-        uses: softprops/action-gh-release@v3
-        if: github.event_name == 'release'
+      # 10. 产物先留在工作流里，等 verify 通过后再由 publish job 统一发布
+      - name: 上传完整包（待验证）
+        uses: actions/upload-artifact@v4
         with:
-          files: release-assets/*
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          name: full-packages
+          path: release-assets/
+          retention-days: 7
 
-      # 11. Clean up Nightly Release to prevent stale files
-      - name: Clean up Nightly Release
-        if: github.event_name != 'release'
+  # ================================================================
+  # 多架构真机验证：用 QEMU 在目标架构容器里把包当真实安装包装一遍
+  # ================================================================
+  verify:
+    name: 验证 ${{ matrix.name }}
+    needs: build-release
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { name: x86_64-linux, platform: 'linux/amd64' }
+          - { name: aarch64-linux, platform: 'linux/arm64' }
+          - { name: arm-linux,   platform: 'linux/arm/v7' }
+          - { name: x86-linux,   platform: 'linux/386' }
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.workflow_run.head_sha || github.sha }}
+
+      - name: 注册 QEMU（多架构模拟）
+        uses: docker/setup-qemu-action@v3
+
+      - name: 取回待验证的完整包
+        uses: actions/download-artifact@v4
+        with:
+          name: full-packages
+          path: pkgs
+
+      - name: 容器内真实安装并运行
         run: |
-          gh release delete nightly --cleanup-tag --yes || true
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PKG=$(ls pkgs/*${{ matrix.name }}-all.tar.gz | head -1)
+          [ -n "$PKG" ] || { echo "::error::没有找到 ${{ matrix.name }} 的包"; ls -la pkgs; exit 1; }
+          echo "待验证包: $(basename "$PKG")"
+          docker run --rm \
+            --platform ${{ matrix.platform }} \
+            -v "$PWD/pkgs:/pkg:ro" \
+            -v "$PWD/ci:/ci:ro" \
+            alpine:latest sh /ci/verify-package.sh "/pkg/$(basename "$PKG")"
 
-      # 12. Upload all packages and binaries individually to the GitHub Nightly Release (on non-release events like schedule/workflow_dispatch)
-      - name: Upload Nightly Release Assets
-        uses: softprops/action-gh-release@v3
-        if: github.event_name != 'release'
+  # ================================================================
+  # 发布：只有上面全部验证通过，才会走到这里
+  # ================================================================
+  publish:
+    name: 发布 Release
+    needs: [build-release, verify]
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
         with:
-          tag_name: nightly
-          name: "SmartDNS Nightly Build"
-          body: |
-            This release contains the latest automated Nightly build of SmartDNS.
+          fetch-depth: 0
+          ref: ${{ github.event.workflow_run.head_sha || github.sha }}
 
-            - **Commit**: ${{ github.sha }}
-            - **Branch**: `${{ github.ref_name }}`
-            - **Build Time**: ${{ github.event.head_commit.timestamp || github.event.repository.updated_at }}
+      - name: 取回完整包
+        uses: actions/download-artifact@v4
+        with:
+          name: full-packages
+          path: release-assets
 
-            These packages are automatically compiled and updated on every nightly build / manual run.
-          prerelease: true
-          files: release-assets/*
-          overwrite_files: true
+      - name: 取回独立插件产物（x86_64，来自 build-ui）
+        if: github.event_name == 'workflow_run'
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ github.token }}
+        continue-on-error: true
+        run: |
+          mkdir -p dist
+          gh run download ${{ github.event.workflow_run.id }} \
+            --repo "$GITHUB_REPOSITORY" -n smartdns_ui.so -D dist
+          ls -la dist
+
+      - name: 生成版本号与校验和
+        id: ver
+        run: |
+          base=$(git describe --tags --abbrev=0 --match '*_with_ui' --exclude '*canary*' 2>/dev/null || echo "hn")
+          tag="${base}+hn.$(date -u +%Y%m%d).$(git rev-parse --short HEAD)"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "版本号: $tag"
+          if [ -f dist/smartdns_ui.so ]; then
+            (cd dist && sha256sum smartdns_ui.so > sha256.txt)
+          fi
+
+      - name: 创建 Release 并上传全部资产
+        env:
+          GH_TOKEN: ${{ secrets.SYNC_TOKEN }}
+          TAG: ${{ steps.ver.outputs.tag }}
+        run: |
+          gh release create "$TAG" \
+            --title "$TAG" \
+            --notes "smartdns-ui 增强版（客户端主机名显示 + WebUI）。
+
+          - 提交: ${{ github.event.workflow_run.head_sha || github.sha }}
+          - 验证: 单元测试 + 符号兼容性 + 容器冒烟 + **多架构真机验证（x86_64/aarch64/armv7/i686）全部通过后才发布**
+          - 完整包内含本 fork 的 WebUI 前端，覆盖 aarch64 / arm / mips / mipsel / x86_64 / x86
+
+          > WebUI 默认不启用，安装后请按 SmartDNS 官方文档在配置中加载插件。"
+          gh release upload "$TAG" release-assets/* --clobber
+          if [ -f dist/smartdns_ui.so ]; then
+            gh release upload "$TAG" dist/smartdns_ui.so dist/sha256.txt --clobber
+          fi
+          echo "已发布 $TAG"
+
+      - name: 只保留最近 10 个 release
+        env:
+          GH_TOKEN: ${{ secrets.SYNC_TOKEN }}
+        continue-on-error: true
+        run: |
+          gh release list --limit 200 --json tagName --jq '.[].tagName' \
+            | tail -n +11 \
+            | xargs -r -I{} gh release delete {} --yes --cleanup-tag

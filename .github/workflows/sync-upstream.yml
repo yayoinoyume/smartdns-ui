@@ -1,0 +1,113 @@
+name: Sync upstream (PikuZheng)
+
+# 把上游 PikuZheng/smartdns 的新提交合进我们的两个分支。
+# 用 merge 而不是强推 —— 因为 archive-master 上放着我们自己的 workflow 文件，
+# 强推会把它抹掉（上游自带的 fetch upstream.yml 就是强推，所以那个要禁用）。
+#
+# 冲突时直接失败退出，让 GitHub 发邮件通知人去处理，不做任何猜测性操作。
+# 处理期间路由器上跑的还是旧版本，线上不受影响。
+#
+# 为什么必须用 PAT 而不是自带的 GITHUB_TOKEN：
+#   GITHUB_TOKEN 的推送不会触发下一个 workflow，
+#   那样合完了也不会自动编译，等于白合。
+
+on:
+  schedule:
+    - cron: '0 19 * * *'   # UTC 19:00 = 北京时间次日 03:00
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  sync:
+    name: 同步上游并推进特性分支
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: archive-master
+          fetch-depth: 0
+          token: ${{ secrets.SYNC_TOKEN }}
+
+      # 先验写权限再干活。否则会在 git push 那里报一个含糊的 exit 128，
+      # 而真实原因（令牌没有写权限 / 密钥名写错 / 令牌过期）要翻半天日志。
+      #
+      # 重要：不要用 `gh api repos/... --jq .permissions.push` 做这个检查。
+      # 那个字段反映的是「当前账号在该仓库的角色」，不是「这个令牌被授予的权限」
+      # —— 仓库所有者永远是 push=true，所以那样检查永远通过，等于没检查。
+      # （实测踩过：首次触发时预检显示 success，紧接着推送就 403。）
+      #
+      # 正确做法：做一次 dry-run push。它会真的连上去完成认证与权限校验，
+      # 但不会真的改动任何 ref。
+      - name: 预检 SYNC_TOKEN 写权限
+        env:
+          GH_TOKEN: ${{ secrets.SYNC_TOKEN }}
+        run: |
+          if [ -z "${GH_TOKEN:-}" ]; then
+            echo "::error::仓库密钥 SYNC_TOKEN 不存在或为空。"
+            echo "::error::检查 Settings → Secrets and variables → Actions 里的名字是否正好是 SYNC_TOKEN。"
+            exit 1
+          fi
+          echo "SYNC_TOKEN 属于账号: $(gh api user --jq .login 2>/dev/null || echo '(读不到)')"
+
+          if git push --dry-run origin HEAD:refs/heads/archive-master > /tmp/dryrun.log 2>&1; then
+            echo "SYNC_TOKEN 写权限正常"
+          else
+            echo "::error::SYNC_TOKEN 没有写权限。git 的原话："
+            sed 's/^/::error::/' /tmp/dryrun.log
+            echo "::error::—— 修正办法 ——"
+            echo "::error::Settings → Developer settings → Personal access tokens → Fine-grained tokens"
+            echo "::error::→ 编辑该令牌 → Repository permissions → Contents 改成 Read and write → 保存"
+            echo "::error::注意：如果建令牌时选的是 'Public repositories (read-only)'，权限是锁死的、改不了，需重新建一个。"
+            echo "::error::改完直接重跑本 workflow 即可，不用动任何代码。"
+            exit 1
+          fi
+
+      - name: git 身份
+        run: |
+          git config user.name  'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+
+      - name: 抓取上游
+        run: |
+          # 用 set-url + add 双保险：重复添加会以退出码 3 失败，
+          # 在 Actions 默认的 bash -e 下会直接中断整个步骤。
+          git remote set-url upstream https://github.com/PikuZheng/smartdns.git 2>/dev/null \
+            || git remote add upstream https://github.com/PikuZheng/smartdns.git
+          git remote -v
+          git fetch upstream master
+          echo "上游 master 最新提交:"
+          git log --oneline -3 upstream/master
+
+      - name: 合并上游到 archive-master
+        run: |
+          if git merge --no-edit upstream/master; then
+            echo "archive-master 合并干净"
+          else
+            git merge --abort
+            echo "::error::上游合并到 archive-master 有冲突，需要人工处理（本地 fetch 后手工 merge）。"
+            exit 1
+          fi
+
+      - name: 推送 archive-master
+        run: |
+          echo "推送前 archive-master = $(git rev-parse HEAD)"
+          git push origin archive-master
+          echo "archive-master 已推送"
+
+      - name: 把 archive-master 合进 main
+        run: |
+          git fetch origin main
+          git checkout main
+          if git merge --no-edit origin/archive-master; then
+            echo "main 合并干净"
+          else
+            git merge --abort
+            echo "::error::archive-master 合并到 main 有冲突，需要人工处理。"
+            echo "::error::提示：冲突很可能在 plugin/smartdns-ui/src/ 下，也就是我们改动的那 6 个文件。"
+            exit 1
+          fi
+          echo "推送前 main = $(git rev-parse HEAD)"
+          git push origin main
+          echo "main 已推送 —— 这一步会触发 build-ui.yml 编译发版"

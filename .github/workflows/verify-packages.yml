@@ -1,0 +1,96 @@
+name: Verify Release Packages (multi-arch)
+
+# 用 QEMU 在「目标架构的容器」里，把 release 包当成真实安装包验证一遍：
+# 解压 → 安装 → 启动 → 断言（插件加载 / 租约生效 / DNS / WebUI）。
+#
+# 用途：复验任意已发布的 release（主线发布流程已在 release.yml 内自带验证，
+# 这里保留作为「事后抽查 / 补验历史版本」的工具）。
+# 触发：仅手动。留空 tag 则验证最近一次正式 release。
+#
+# 覆盖架构：x86_64 / aarch64 / armv7 / i686
+# 未覆盖：mips、mipsel —— Alpine 与 Debian 均已放弃这些架构的镜像，
+#         无可用容器基础镜像，只能靠打包阶段的静态检查。
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: '要验证的 release tag（留空 = 最近一次正式 release）'
+        required: false
+
+permissions:
+  contents: read
+
+jobs:
+  # 先决定要验证哪个 tag
+  resolve:
+    name: 确定待验证版本
+    runs-on: ubuntu-24.04
+    if: github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success'
+    outputs:
+      tag: ${{ steps.pick.outputs.tag }}
+    steps:
+      - id: pick
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          TAG="${{ github.event.inputs.tag }}"
+          if [ -z "$TAG" ]; then
+            TAG=$(gh release list --repo "$GITHUB_REPOSITORY" \
+                    --exclude-pre-releases --limit 1 \
+                    --json tagName --jq '.[0].tagName')
+          fi
+          if [ -z "$TAG" ] || [ "$TAG" = "null" ]; then
+            echo "::error::找不到可验证的 release"
+            exit 1
+          fi
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "本次验证版本: $TAG"
+
+  verify:
+    name: 验证 ${{ matrix.name }}
+    needs: resolve
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { name: x86_64-linux, platform: 'linux/amd64' }
+          - { name: aarch64-linux, platform: 'linux/arm64' }
+          - { name: arm-linux,   platform: 'linux/arm/v7' }
+          - { name: x86-linux,   platform: 'linux/386' }
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 注册 QEMU（多架构模拟）
+        uses: docker/setup-qemu-action@v3
+
+      - name: 下载该架构的发布包
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          TAG="${{ needs.resolve.outputs.tag }}"
+          echo "验证 release: $TAG"
+          mkdir -p /tmp/pkgs
+          gh release download "$TAG" --repo "$GITHUB_REPOSITORY" \
+            --pattern "*${{ matrix.name }}-all.tar.gz" --dir /tmp/pkgs
+          ls -la /tmp/pkgs
+
+      - name: 容器内真实安装并运行
+        run: |
+          PKG=$(ls /tmp/pkgs/*.tar.gz | head -1)
+          echo "待验证包: $(basename "$PKG")"
+          docker run --rm \
+            --platform ${{ matrix.platform }} \
+            -v /tmp/pkgs:/pkg:ro \
+            -v "$GITHUB_WORKSPACE/ci:/ci:ro" \
+            alpine:latest sh /ci/verify-package.sh "/pkg/$(basename "$PKG")"
+
+      - name: 结果汇总
+        if: always()
+        run: |
+          if [ "${{ job.status }}" = "success" ]; then
+            echo "### ✅ ${{ matrix.name }} — 包可用" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "### ❌ ${{ matrix.name }} — 包验证失败" >> $GITHUB_STEP_SUMMARY
+          fi
