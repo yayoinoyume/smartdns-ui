@@ -5,6 +5,12 @@ on:
     - cron: '0 0 * * *' # Runs once a day (https://crontab.guru/once-a-day)
   workflow_dispatch:
 
+# 清理缓存与删除旧运行都需要 actions: write。
+# 改用内置的 github.token，不再依赖从未配置过的 secrets.TOKEN。
+permissions:
+  actions: write
+  contents: read
+
 jobs:
   clear:
     name: Clear cache
@@ -14,12 +20,12 @@ jobs:
       uses: MyAlbum/purge-cache@v2
       with:
         max-age: 86400 
-        token: ${{ secrets.TOKEN }}
+        token: ${{ github.token }}
 
     - name: Delete workflow runs
       uses: Mattraks/delete-workflow-runs@v2
       with:
-        token: ${{ secrets.TOKEN }}
+        token: ${{ github.token }}
         repository: ${{ github.repository }}
         retain_days: 7
         keep_minimum_runs: 7
