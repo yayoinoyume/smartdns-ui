@@ -486,6 +486,12 @@ impl DnsRequest for DnsRequest_C {
     fn get_group_name(&self) -> String {
         unsafe {
             let group_name = smartdns_c::dns_server_request_get_group_name(self.request);
+            // 不属于任何分组的查询，主程序返回的是 NULL。
+            // 直接 from_ptr 会解引用空指针（未定义行为），读到内存里的随机数据，
+            // 最终以乱码形式写进数据库，仪表板「分组」列就会显示成乱码。
+            if group_name.is_null() {
+                return String::new();
+            }
             std::ffi::CStr::from_ptr(group_name)
                 .to_string_lossy()
                 .into_owned()
@@ -495,6 +501,10 @@ impl DnsRequest for DnsRequest_C {
     fn get_domain(&self) -> String {
         unsafe {
             let domain = smartdns_c::dns_server_request_get_domain(self.request);
+            // 与 get_group_name 同理：主程序可能返回 NULL，必须先判空。
+            if domain.is_null() {
+                return String::new();
+            }
             std::ffi::CStr::from_ptr(domain)
                 .to_string_lossy()
                 .into_owned()
