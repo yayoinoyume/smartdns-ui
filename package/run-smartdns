@@ -28,4 +28,8 @@ if [ ! -f ${INTERPRETER} ]; then
 fi
 
 cd $CURDIR
+# OpenWrt init 脚本会注入 LD_LIBRARY_PATH=/usr/lib/smartdns:/usr/lib:/lib，
+# 它优先级高于二进制 RPATH，会加载系统里与包内 musl 不匹配的 libc 而段错误。
+# 实测：带上该变量秒崩，不设或指向包内 lib 时均正常，故此处清除。
+unset LD_LIBRARY_PATH
 SMARTDNS_WORKDIR="$CWD" exec "${SMARTDNS_BIN}" $@
