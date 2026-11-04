@@ -29,6 +29,21 @@ fn get_git_commit_version() {
     println!("cargo:rustc-env=GIT_VERSION={}", git_version.trim());
 }
 
+/*
+跨架构编译时关掉 bindgen 的布局断言：libclang 按 C 视角算出的 long double
+尺寸与 Rust 侧对不上（Rust 没有 long double，bindgen 会退化成 f64），
+max_align_t 这类断言必然误报。struct 的真实布局由 rustc 按目标计算，
+不受这些断言影响；本插件与 smartdns 头文件也不使用 long double / max_align_t。
+架构一致时保持默认行为，布局断言照旧生成。
+*/
+fn is_cross_arch() -> bool {
+    let target = env::var("TARGET").unwrap_or_default();
+    let host = env::var("HOST").unwrap_or_default();
+    let target_arch = target.split('-').next().unwrap_or_default();
+    let host_arch = host.split('-').next().unwrap_or_default();
+    target_arch != host_arch
+}
+
 fn link_rename_lib() {
     /*
     rename the output file to smartdns_ui.so
@@ -85,6 +100,9 @@ fn link_smartdns_lib() {
         bindgen::Builder::default().header(format!("{}/smartdns/smartdns.h", smartdns_inc_dir));
     if let Some(sysroot) = sysroot {
         bindings_builder = bindings_builder.clang_arg(format!("--sysroot={}", sysroot));
+    }
+    if is_cross_arch() {
+        bindings_builder = bindings_builder.layout_tests(false);
     }
     let bindings = bindings_builder
         .clang_arg(format!("-I{}/include", smartdns_src_dir))
