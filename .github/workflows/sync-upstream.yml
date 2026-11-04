@@ -103,10 +103,29 @@ jobs:
           if git merge --no-edit origin/archive-master; then
             echo "main 合并干净"
           else
-            git merge --abort
-            echo "::error::archive-master 合并到 main 有冲突，需要人工处理。"
-            echo "::error::提示：冲突很可能在 plugin/smartdns-ui/src/ 下，也就是我们改动的那 6 个文件。"
-            exit 1
+            # 上游自带的 `.github/workflows/fetch upstream.yml` 我们 fork 早就删了（e29ccb9），
+            # 上游那份做的是强推式同步，和我们的策略正面冲突，所以我们不要它。
+            # 之后每次上游改这个文件，merge 都会变成 modify/delete 冲突 —— 这是历史遗留的、
+            # 唯一一个已知且结论已经定死的冲突点。只在「冲突文件恰好只有它一个」时自动按删除收尾，
+            # 别的情况（含真实代码冲突、或冲突清单为空）一律照旧中止交人工，绝不猜测。
+            conflicts="$(git diff --name-only --diff-filter=U)"
+            if [ "$conflicts" = ".github/workflows/fetch upstream.yml" ]; then
+              echo "唯一冲突是上游修改了 fetch upstream.yml，按 fork 既定策略丢弃该文件后继续合并。"
+              git rm -f '.github/workflows/fetch upstream.yml'
+              git commit --no-edit
+              echo "已按 fork 既定策略丢弃上游的 fetch upstream.yml，main 合并完成"
+            else
+              git merge --abort
+              echo "::error::archive-master 合并到 main 有冲突，需要人工处理。"
+              echo "::error::提示：冲突很可能在 plugin/smartdns-ui/src/ 下，也就是我们改动的那 6 个文件。"
+              echo "::error::本次冲突文件清单："
+              if [ -n "$conflicts" ]; then
+                printf '%s\n' "$conflicts" | sed 's/^/::error::  /'
+              else
+                echo "::error::  （清单为空）"
+              fi
+              exit 1
+            fi
           fi
           echo "推送前 main = $(git rev-parse HEAD)"
           git push origin main
