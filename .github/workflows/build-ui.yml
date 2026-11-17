@@ -5,12 +5,12 @@ name: Build smartdns_ui.so
 # 由它打包全架构完整包（内含本插件 + WebUI 前端）、做多架构真机验证，
 # 全部通过后才真正创建 release。
 #
-# 上游更新会由 sync-upstream.yml 合进 main；
+# 上游更新会由 sync-upstream.yml 合进 prod（生产分支）；
 # 只要插件目录 / C 头文件 / CI 配置有变化，这里就会自动编译、验证、发版。
 
 on:
   push:
-    branches: [main]
+    branches: [prod]
     paths:
       - 'plugin/smartdns-ui/**'
       - 'src/include/**'

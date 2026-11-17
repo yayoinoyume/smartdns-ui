@@ -419,7 +419,9 @@ impl DataStats {
 
         let ret = self
             .db
-            .delete_domain_before_timestamp(now - self.conf.read().unwrap().max_log_age_ms as u64);
+            .delete_domain_before_timestamp(
+                now.saturating_sub(self.conf.read().unwrap().max_log_age_ms as u64),
+            );
         if let Err(e) = ret {
             if e.to_string() != "Query returned no rows" {
               dns_log!(
@@ -444,28 +446,23 @@ impl DataStats {
         }
         let _ = self
             .db
-            .delete_hourly_detail_before_timestamp(now - 30 * 24 * 3600 * 1000);
+            .delete_hourly_detail_before_timestamp(now.saturating_sub(30 * 24 * 3600 * 1000));
 
-        let ret = self.db.refresh_client_top_list(now - 7 * 24 * 3600 * 1000);
+        let ret = self.db.refresh_client_top_list(now.saturating_sub(7 * 24 * 3600 * 1000));
         if let Err(e) = ret {
             dns_log!(LogLevel::WARN, "refresh client top list error: {}", e);
         }
 
-        let ret = self.db.refresh_domain_top_list(now - 7 * 24 * 3600 * 1000);
+        let ret = self.db.refresh_domain_top_list(now.saturating_sub(7 * 24 * 3600 * 1000));
         if let Err(e) = ret {
             dns_log!(LogLevel::WARN, "refresh domain top list error: {}", e);
         }
-        // TODO: 下面两条清理的阈值疑似写错：这里传的是「30 / 90 天的**毫秒数**」，
-        // 而这两个函数是拿它跟「时间戳（毫秒）」比较的，等于传了个 1970 年前后的时间点，
-        // 结果一行都删不掉。正确写法应该是 now - 30 * 24 * 3600 * 1000。
-        // 本次**故意保持原行为**：一旦修好，domain_hourly_count / domain_daily_count
-        // 就会开始真正删除数据，需要用户单独批准后再改。
         let _ = self
             .db
-            .delete_hourly_query_count_before_timestamp(30 * 24 * 3600 * 1000);
+            .delete_hourly_query_count_before_timestamp(now.saturating_sub(30 * 24 * 3600 * 1000));
         let _ = self
             .db
-            .delete_daily_query_count_before_timestamp(90 * 24 * 3600 * 1000);
+            .delete_daily_query_count_before_timestamp(now.saturating_sub(90 * 24 * 3600 * 1000));
     }
 
     /// 手动刷新（`PUT /api/stats/refresh`）入口：与整点 worker 共用同一把

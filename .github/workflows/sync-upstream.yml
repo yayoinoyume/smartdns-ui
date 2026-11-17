@@ -1,11 +1,18 @@
 name: Sync upstream (PikuZheng)
 
-# 把上游 PikuZheng/smartdns 的新提交合进我们的两个分支。
-# 用 merge 而不是强推 —— 因为 archive-master 上放着我们自己的 workflow 文件，
-# 强推会把它抹掉（上游自带的 fetch upstream.yml 就是强推，所以那个要禁用）。
+# 分支约定：
+#   archive-master —— 纯上游镜像，始终等于 PikuZheng/smartdns 的 master。
+#   main           —— 纯上游镜像，直接强推到 archive-master 的同一提交。
+#   prod           —— 生产分支，承载 fork 的全部改动（UI 特性、构建/发布 workflow）。
 #
-# 冲突时直接失败退出，让 GitHub 发邮件通知人去处理，不做任何猜测性操作。
+# 同步顺序：上游 → archive-master → main（强推镜像）→ prod（merge）。
+# main 的强推是刻意为之：它只作为「上游对照分支」，不承载任何 fork 改动。
+# prod 合并冲突时直接失败退出，交人工处理，不做任何猜测性操作。
 # 处理期间路由器上跑的还是旧版本，线上不受影响。
+#
+# 注意：schedule / workflow_dispatch 只读默认分支上的 workflow 文件。
+# 默认分支若仍是 main（纯上游、没有本文件），定时同步不会运行；
+# 把 prod 设为默认分支后才会恢复。
 #
 # 为什么必须用 PAT 而不是自带的 GITHUB_TOKEN：
 #   GITHUB_TOKEN 的推送不会触发下一个 workflow，
@@ -21,7 +28,7 @@ permissions:
 
 jobs:
   sync:
-    name: 同步上游并推进特性分支
+    name: 同步上游并推进生产分支
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -96,12 +103,26 @@ jobs:
           git push origin archive-master
           echo "archive-master 已推送"
 
-      - name: 把 archive-master 合进 main
+      - name: 把 main 重置为纯上游镜像
         run: |
           git fetch origin main
-          git checkout main
-          if git merge --no-edit origin/archive-master; then
-            echo "main 合并干净"
+          echo "main 重置前 = $(git rev-parse origin/main)"
+          git checkout -B main origin/archive-master
+          # --force-with-lease：只有远端 main 仍停在 fetch 时的位置才允许覆盖，
+          # 期间有人推送过 main 就失败，避免误伤。
+          if git push --force-with-lease origin main; then
+            echo "main 已重置为上游镜像 = $(git rev-parse HEAD)"
+          else
+            echo "::error::main 强推失败（可能有人在同步期间推送了 main），需要人工检查。"
+            exit 1
+          fi
+
+      - name: 把 main 合进 prod
+        run: |
+          git fetch origin prod
+          git checkout -B prod origin/prod
+          if git merge --no-edit origin/main; then
+            echo "prod 合并干净"
           else
             # 上游自带的 `.github/workflows/fetch upstream.yml` 我们 fork 早就删了（e29ccb9），
             # 上游那份做的是强推式同步，和我们的策略正面冲突，所以我们不要它。
@@ -113,10 +134,10 @@ jobs:
               echo "唯一冲突是上游修改了 fetch upstream.yml，按 fork 既定策略丢弃该文件后继续合并。"
               git rm -f '.github/workflows/fetch upstream.yml'
               git commit --no-edit
-              echo "已按 fork 既定策略丢弃上游的 fetch upstream.yml，main 合并完成"
+              echo "已按 fork 既定策略丢弃上游的 fetch upstream.yml，prod 合并完成"
             else
               git merge --abort
-              echo "::error::archive-master 合并到 main 有冲突，需要人工处理。"
+              echo "::error::main 合并到 prod 有冲突，需要人工处理。"
               echo "::error::提示：冲突很可能在 plugin/smartdns-ui/src/ 下，也就是我们改动的那 6 个文件。"
               echo "::error::本次冲突文件清单："
               if [ -n "$conflicts" ]; then
@@ -127,6 +148,6 @@ jobs:
               exit 1
             fi
           fi
-          echo "推送前 main = $(git rev-parse HEAD)"
-          git push origin main
-          echo "main 已推送 —— 这一步会触发 build-ui.yml 编译发版"
+          echo "推送前 prod = $(git rev-parse HEAD)"
+          git push origin prod
+          echo "prod 已推送 —— 这一步会触发 build-ui.yml 编译发版"
